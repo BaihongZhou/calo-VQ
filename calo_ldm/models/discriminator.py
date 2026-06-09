@@ -1,29 +1,38 @@
 import torch
 from torch import nn
 import pytorch_lightning as pl
+import torch.nn.functional as F
 
-from ..layers import CylinderConv
+from ..layers import PlaneConv
 from ..layers.misc import LogScale
-from ..layers.fft import FFTDownsample,FFTDownsampleV2
 from ..util import get_activation_by_name, parse_conv_spec
 
+
 class Discriminator(pl.LightningModule):
+    """DarkSHINE xyz GAN discriminator (PatchGAN-style over the x-y plane).
+
+    Kept as a load-bearing component: the paper shows L1/L2 reconstruction alone
+    is insufficient for fidelity, so the adversarial term is essential. This is
+    the plain-2D-conv (xyz) version of the original cylindrical discriminator;
+    cyclic padding and FFT downsampling have been removed.
+    """
     def __init__(self, *,
-            ch_in,
+            ch_in,                 # depth = 11
             conv_spec,
             cond_dim=0,
             activation='swish',
             ch_init=-1,
-            log_scale_params=None, 
+            log_scale_params=None,
+            pad_to=48,
             pooling=None,
             ):
         super().__init__()
 
         if cond_dim not in (0, 1):
-            raise NotImplementedError("todo")
-
+            raise NotImplementedError("cond_dim>1 not handled yet.")
         self.register_buffer('cond_dim', torch.tensor(cond_dim))
-        
+        self.pad_to = pad_to
+
         activation_class = get_activation_by_name(activation)
 
         w_in = ch_in + cond_dim
@@ -32,47 +41,21 @@ class Discriminator(pl.LightningModule):
         for spec in conv_spec:
             ltype, *spec = spec.split(':')
             ltype = ltype.strip()
-            if ltype == 'fftd':
-                args = {}
-                args['n_drop'] = int(spec[0])
-                self.layers.append(FFTDownsample(**args))
-                continue
-            elif ltype == 'fftd1':
-                args = {"fft_dim":1}
-                args['n_drop'] = int(spec[0])
-                self.layers.append(FFTDownsampleV2(**args))
-                continue
-            elif ltype == 'fftd2':
-                args = {"fft_dim":2}
-                args['n_drop'] = int(spec[0])
-                self.layers.append(FFTDownsampleV2(**args))
-                continue
-            elif ltype == 'fftd3':
-                args = {"fft_dim":3}
-                args['n_drop'] = int(spec[0])
-                self.layers.append(FFTDownsampleV2(**args))
-                continue
-
-            assert ltype == 'cconv'
-
+            assert ltype == 'pconv', f"xyz discriminator only supports 'pconv', got {ltype!r}"
             k, s, p, w_out = parse_conv_spec(':'.join(spec), w_out)
-            self.layers.append(CylinderConv(w_in, w_out, k=k, stride=s, pad_z=p))
+            self.layers.append(PlaneConv(w_in, w_out, k=k, stride=s, pad_z=p))
             w_in = w_out
-
             self.layers.append(activation_class())
 
         if pooling is None:
-            # final output layer to reshape to single logit
-            self.layers.append(CylinderConv(w_in, 1, k=(1,1), stride=(1,1), pad_z=False))
-        else:
-            if pooling == 'max':
-                self.layers.append(nn.AdaptiveMaxPool2d((1,1)))
-            elif pooling == 'avg':
-                self.layers.append(nn.AdaptiveAvgPool2d((1,1)))
-                self.layers.append(nn.Conv2d(w_in, w_in, kernel_size=(1,1), stride=1))
-                self.layers.append(activation_class())
-                self.layers.append(nn.Conv2d(w_in, 1, kernel_size=(1,1), stride=1))
-
+            self.layers.append(PlaneConv(w_in, 1, k=(1, 1), stride=(1, 1), pad_z=False))
+        elif pooling == 'max':
+            self.layers.append(nn.AdaptiveMaxPool2d((1, 1)))
+        elif pooling == 'avg':
+            self.layers.append(nn.AdaptiveAvgPool2d((1, 1)))
+            self.layers.append(nn.Conv2d(w_in, w_in, kernel_size=(1, 1), stride=1))
+            self.layers.append(activation_class())
+            self.layers.append(nn.Conv2d(w_in, 1, kernel_size=(1, 1), stride=1))
 
         if log_scale_params:
             self.log_scale = LogScale(*log_scale_params)
@@ -80,11 +63,15 @@ class Discriminator(pl.LightningModule):
             self.register_module('log_scale', None)
 
     def forward(self, x, cond=None):
-        x = self.log_scale(x)
+        if self.log_scale is not None:
+            x = self.log_scale(x)
 
         if self.cond_dim > 0:
-            xc = cond[:,None,None].expand((-1,-1,x.shape[-2],x.shape[-1]))
-            x = torch.concat([x,xc], axis=-3)
+            xc = cond[:, None, None].expand((-1, -1, x.shape[-2], x.shape[-1]))
+            x = torch.concat([x, xc], axis=-3)
 
-        out = self.layers(x)
-        return out
+        pad = self.pad_to - x.shape[-1]
+        if pad > 0:
+            x = F.pad(x, (0, pad, 0, pad))
+
+        return self.layers(x)

@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 import torch.nn.functional as F
-from math import floor, ceil
 
 from .layers.misc import (
         VoxelSoftmax, FlatVoxelSoftmax,
@@ -12,7 +11,21 @@ from .layers.misc import (
 
 import importlib
 import sys
-import re
+
+def load_geom_mask(path):
+    """Load the DarkSHINE fixed geometry mask.
+
+    The mask is stored channels-last as (x=43, y=43, depth=11) bool, marking the
+    real LYSO crystal cells (True) vs padding (False). It is the SAME for every
+    sample. We return it channels-first as (depth=11, x=43, y=43) so it lines up
+    with the network's (N, C=depth, H=x, W=y) tensor layout.
+    """
+    import numpy as np
+    m = np.load(path)
+    t = torch.from_numpy(np.ascontiguousarray(m)).bool()  # (43, 43, 11)
+    t = t.permute(2, 0, 1).contiguous()                   # (11, 43, 43)
+    return t
+
 
 def recursive_to(obj, device):
     if isinstance(obj, dict):
@@ -147,72 +160,3 @@ def measure_perplexity(predicted_indices, n_embed):
     cluster_use = torch.sum(avg_probs > 0) / n_embed # count all non zero embed
     return perplexity, cluster_use
 
-def _cal_RZA(RZA,hR,hZ,hA):
-    R,Z,A=RZA
-    if hR:
-        R=floor(R/2)
-    if hZ:
-        Z=floor(Z/2)
-    if hA:
-        A=ceil(A/2)
-    return [R,Z,A]
-
-def cal_RZA(RZA,p):
-    r=parse_spec_str(p)
-    return _cal_RZA(RZA,r["hR"],r["hZ"],r["hA"])
-
-def parse_spec_str(p):
-    mat = re.match("[RAZO]+(\d+)[FX]*",p)
-    if not mat:
-        print("Not implemented spec!",p)
-        assert False 
-    dim=int(mat.group(1))
-    hR="R" in p
-    hZ="Z" in p
-    hA="A" in p
-    X="X" in p
-    FFT="F" in p
-    O="O" in p
-    return {
-        "hR":hR,
-        "hZ":hZ,
-        "hA":hA,
-        "XFORMER":X,
-        "FFT":FFT,
-        "O":O,
-        "dim":dim,
-    }
-
-# conv2s version #############################################
-def _cal_ZA(ZA,hZ,hA):
-    Z,A=ZA
-    if hZ:
-        Z=floor(Z/2)
-    if hA:
-        A=ceil(A/2)
-    return [Z,A]
-
-def cal_ZA(ZA,p):
-    r=parse_spec_str_conv2s(p)
-    return _cal_ZA(ZA,r["hZ"],r["hA"])
-
-def parse_spec_str_conv2s(p):
-    mat = re.match("[AZO]+(\d+)[FX]*",p)
-    if not mat:
-        print("Not implemented spec!",p)
-        assert False 
-    dim=int(mat.group(1))
-    hZ="Z" in p
-    hA="A" in p
-    X="X" in p
-    FFT="F" in p
-    O="O" in p
-    return {
-        "hZ":hZ,
-        "hA":hA,
-        "XFORMER":X,
-        "FFT":FFT,
-        "O":O,
-        "dim":dim,
-    }
-    

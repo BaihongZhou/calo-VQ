@@ -1,0 +1,50 @@
+# DarkSHINE stage 2 (GPT prior) smoke config.
+# `vq_config.checkpoint` is overridden on the CLI with the stage-1 checkpoint.
+# R ~ 1e-3 for DarkSHINE (4 GeV in, ~3.9 GeV deposited), so R_max is set just
+# above the observed maximum and R_bits gives fine resolution.
+data:
+  target: calo_ldm.data.DataModuleFromConfig
+  params:
+    num_workers: 0
+    pin_memory: false
+    batch_size: 32
+    train:
+      target: calo_ldm.data.CaloDarkSHINE
+      params:
+        file_path: "DarkSHINE_data/export.h5"
+        load_partial: 512
+    validation:
+      target: calo_ldm.data.CaloDarkSHINE
+      params:
+        file_path: "DarkSHINE_data/export.h5"
+        load_partial: 256
+model:
+  base_learning_rate: 3.0e-06
+  monitor: val/loss
+  target: calo_ldm.models.CondGPT
+  params:
+    pure_mode: true
+    R_renorm: true
+    record_freq: 1000
+    codebook_size: 1024
+    sequence_shape:
+    - 6
+    - 6
+    n_layer: 2
+    n_head: 2
+    n_embd: 64
+    predict_R: true
+    R_bits: 16
+    R_max: 0.0011
+    cond_bins: 0
+    vq_config:
+      model_config: config/darkshine_step1.yaml
+      checkpoint: OVERRIDE_ME.ckpt
+lightning:
+  trainer:
+    max_epochs: 1
+    limit_train_batches: 4
+    limit_val_batches: 2
+    num_sanity_val_steps: 0
+    log_every_n_steps: 1
+    enable_progress_bar: false

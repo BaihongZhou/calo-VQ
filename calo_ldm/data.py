@@ -173,6 +173,43 @@ class CaloHDF5(Dataset):
         print(f"After preload: CPU mem {total_memory/1024/1024/1024:.1f} GB")
         return len(self._e_inc)
 
+class CaloDarkSHINE(Dataset):
+    """DarkSHINE ECAL dataset (export.h5).
+
+    Keys: `condition` (N,1) incident energy [MeV], `energy` (N,43,43,11) deposited
+    energy per cell, `label` (N,43,43,11) per-event hit flag (unused by the model;
+    the geometry mask is a fixed, sample-independent buffer loaded separately).
+
+    The data is channels-LAST (N, x=43, y=43, depth=11). We permute it to
+    channels-FIRST (N, depth=11, x=43, y=43) so depth is the conv channel axis and
+    (x, y) is the 2D image plane -- matching the (N, C, H, W) convention used by the
+    encoder/decoder/discriminator. No periodic/rotation augmentation is applied:
+    the staggered geometry mask alternates by layer parity, so an x/y flip would
+    misalign the data with the mask.
+    """
+    def __init__(self, file_path, load_partial=None, key_energy='energy',
+                 key_condition='condition'):
+        super().__init__()
+        print(f"Load DarkSHINE from {file_path}", os.path.exists(file_path))
+        if load_partial:
+            print("WARNING: load partial dataset (only for debug!)")
+        with h5py.File(file_path, 'r') as h5_file:
+            E = torch.from_numpy(h5_file[key_energy][:load_partial]).float()      # (N,43,43,11)
+            self._e_inc = torch.from_numpy(h5_file[key_condition][:load_partial]).float()  # (N,1)
+        # channels-last (N, x, y, depth) -> channels-first (N, depth, x, y)
+        self._data = E.permute(0, 3, 1, 2).contiguous()
+        self.dataset_len = len(self._e_inc)
+
+    def __len__(self):
+        return self.dataset_len
+
+    def __getitem__(self, index):
+        return {
+            'pixels_E': self._data[index].contiguous(),   # (.., 11, 43, 43)
+            'E_inc': self._e_inc[index],                  # (.., 1)
+        }
+
+
 class DataModuleFromConfig(pl.LightningDataModule):
     def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
                  wrap=False, num_workers=None, shuffle_test_loader=False, use_worker_init_fn=False,

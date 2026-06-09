@@ -178,7 +178,9 @@ class CondGPT(pl.LightningModule):
         sequence_len = reduce(lambda x, y: x*y, sequence_shape)
         self.sequence_len=sequence_len
         if self.vq_model.is_ds23:
-            if self.vq_model.dataset_name=="2": # R Z A
+            if self.vq_model.dataset_name == "darkshine":  # depth, x, y
+                self.input_dim = (11, 43, 43)
+            elif self.vq_model.dataset_name == "2":  # R Z A
                 self.input_dim=(9, 45, 16)
             else:
                 self.input_dim=(18, 45, 50)
@@ -224,8 +226,8 @@ class CondGPT(pl.LightningModule):
         self.debug_mode=debug_mode
         assert debug_mode in [0,1,2,-1,-2,-3]
 
-        # loopback test of R coding
-        s=torch.rand([1000,1000])
+        # loopback test of R coding (test within the representable [0, R_max) range)
+        s=torch.rand([1000,1000]) * self.R_max
         s_codes=self.convertR(s)
         s_rep=self.decodeR(s_codes)
         print("loopback test R: error sum",(s_rep-s).sum()/s.sum())
@@ -411,7 +413,7 @@ class CondGPT(pl.LightningModule):
 
         # generate some test pattern
         if      not self.pure_mode \
-                and (not self.trainer.running_sanity_check) \
+                and (not self.trainer.sanity_checking) \
                 and self.current_epoch % self.record_freq == 0:
             self.on_record=True
             self.vq_model.on_record=True

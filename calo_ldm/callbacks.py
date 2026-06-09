@@ -3,8 +3,8 @@ import torchvision
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import Callback, LearningRateMonitor
-from pytorch_lightning.utilities.distributed import rank_zero_only
-from pytorch_lightning.utilities import rank_zero_info
+# PL2: rank-zero helpers moved out of utilities.distributed.
+from pytorch_lightning.utilities.rank_zero import rank_zero_only, rank_zero_info
 
 import os
 import psutil
@@ -30,13 +30,14 @@ class SetupCallback(Callback):
         self.config = config
         self.lightning_config = lightning_config
 
-    def on_keyboard_interrupt(self, trainer, pl_module):
+    def on_exception(self, trainer, pl_module, exception):
         if trainer.global_rank == 0:
             print("Summoning checkpoint.")
             ckpt_path = os.path.join(self.ckptdir, "last.ckpt")
             trainer.save_checkpoint(ckpt_path)
 
-    def on_pretrain_routine_start(self, trainer, pl_module):
+    # PL2: `on_pretrain_routine_start` was removed; `setup` runs before fit/validate.
+    def setup(self, trainer, pl_module, stage=None):
         if trainer.global_rank == 0:
             # Create logdirs and save configs
             os.makedirs(self.logdir, exist_ok=True)
@@ -283,7 +284,7 @@ class ImageLogger(Callback):
         return total_memory/1024/1024/1024
 
     def on_validation_epoch_end(self, trainer, pl_module):
-        if pl_module.trainer.running_sanity_check:
+        if pl_module.trainer.sanity_checking:
             return
 
         if isinstance(pl_module, VQModel):
@@ -322,25 +323,23 @@ class CUDACallback(Callback):
         return total_memory/1024/1024/1024
 
     # see https://github.com/SeanNaren/minGPT/blob/master/mingpt/callback.py
+    # PL2: `trainer.root_gpu` was removed and `on_train_epoch_end` no longer takes
+    # `outputs`. Made CPU-safe so it works on machines without CUDA (e.g. macOS).
     def on_train_epoch_start(self, trainer, pl_module):
-        # Reset the memory use counter
-        torch.cuda.reset_peak_memory_stats(trainer.root_gpu)
-        torch.cuda.synchronize(trainer.root_gpu)
         self.start_time = time.time()
+        if torch.cuda.is_available():
+            device = pl_module.device
+            torch.cuda.reset_peak_memory_stats(device)
+            torch.cuda.synchronize(device)
 
-    def on_train_epoch_end(self, trainer, pl_module, outputs):
-        rank_zero_info(f"Mem count: {self.getMem():.1f} GB")
-        torch.cuda.synchronize(trainer.root_gpu)
-        max_memory = torch.cuda.max_memory_allocated(trainer.root_gpu) / 2 ** 20
+    def on_train_epoch_end(self, trainer, pl_module):
         epoch_time = time.time() - self.start_time
-
-        try:
-            max_memory = trainer.training_type_plugin.reduce(max_memory)
-            epoch_time = trainer.training_type_plugin.reduce(epoch_time)
-
-            rank_zero_info(f"Average Epoch time: {epoch_time:.2f} seconds")
-            rank_zero_info(f"Average Peak GPU memory {max_memory:.2f}MiB")
-        except AttributeError:
-            pass
+        rank_zero_info(f"Mem count: {self.getMem():.1f} GB")
+        rank_zero_info(f"Epoch time: {epoch_time:.2f} seconds")
+        if torch.cuda.is_available():
+            device = pl_module.device
+            torch.cuda.synchronize(device)
+            max_memory = torch.cuda.max_memory_allocated(device) / 2 ** 20
+            rank_zero_info(f"Peak GPU memory {max_memory:.2f}MiB")
 
 

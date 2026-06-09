@@ -1,0 +1,87 @@
+# DarkSHINE stage 1 (VQ-VAE) smoke config.
+# Geometry: channels-last (N,43,43,11) -> channels-first (N,11,43,43); depth(11)
+# is the conv channel axis, (x,y)=43x43 the image plane (padded to 48 internally).
+data:
+  target: calo_ldm.data.DataModuleFromConfig
+  params:
+    num_workers: 0
+    pin_memory: false
+    batch_size: 32
+    train:
+      target: calo_ldm.data.CaloDarkSHINE
+      params:
+        file_path: "DarkSHINE_data/export.h5"
+        load_partial: 512
+    validation:
+      target: calo_ldm.data.CaloDarkSHINE
+      params:
+        file_path: "DarkSHINE_data/export.h5"
+        load_partial: 256
+model:
+  target: calo_ldm.models.VQModel
+  params:
+    dataset_name: darkshine
+    mask_path: DarkSHINE_data/geom_mask.npy
+    do_metric: false
+    embed_dim: 64
+    n_embed: 1024
+    cond_dim: 1
+    log_scale_params:
+    - 0
+    - 3000
+    - 7
+    reco_normalization: R
+    disc_normalization: U
+    encoder_config:
+      target: calo_ldm.models.Encoder
+      params:
+        ch_in: 11
+        ch_out: 128
+        conv_spec:
+        - 'pconv : k3 :     : p :    : c16'   # (16, 48, 48)
+        - 'pconv : k4 : s2 : p : *2 :'        # (32, 24, 24)
+        - 'pconv : k4 : s2 : p : *2 :'        # (64, 12, 12)
+        - 'pconv : k4 : s2 : p : *2 :'        # (128, 6, 6)
+    decoder_config:
+      target: calo_ldm.models.Decoder
+      params:
+        ch_in: 128
+        ch_out: 11
+        conv_spec:
+        - 'pconvT : k4 : s2 : p :    : c64'   # (64, 12, 12)
+        - 'pconvT : k4 : s2 : p : /2 :'       # (32, 24, 24)
+        - 'pconvT : k4 : s2 : p : /2 :'       # (16, 48, 48)
+    loss_config:
+      target: calo_ldm.losses.CombinedLoss
+      params:
+        pixel_power: 2
+        pixel_weight: 1
+        ec_weight: 0.0001
+        width_weight: 0.0001
+        disc_start: 0          # exercise the GAN discriminator from step 0
+        disc_weight: 0.8
+        codebook_weight: 1.0
+        disc_config:
+          target: calo_ldm.models.Discriminator
+          params:
+            pooling: null
+            ch_in: 11
+            conv_spec:
+            - 'pconv : k3 :     : p :    : c16'  # (16, 48, 48)
+            - 'pconv : k4 : s2 : p : *2 :'       # (32, 24, 24)
+            - 'pconv : k4 : s2 : p : *2 :'       # (64, 12, 12)
+            - 'pconv : k4 : s2 : p : *2 :'       # (128, 6, 6)
+        n_embed: 1024
+        reco_normalization: R
+        disc_normalization: U
+        dataset_name: darkshine
+  base_learning_rate: 2.0e-06
+  monitor: val/rec_loss
+lightning:
+  trainer:
+    max_epochs: 1
+    limit_train_batches: 4
+    limit_val_batches: 2
+    num_sanity_val_steps: 0
+    log_every_n_steps: 1
+    enable_progress_bar: false
