@@ -18,6 +18,7 @@ import pytorch_lightning as pl
 
 import calo_ldm.layers.transformer as xfmr
 from calo_ldm.util import instantiate_from_config, recursive_to
+from calo_ldm.metrics import ShowerMetrics
 
 from omegaconf import OmegaConf
 
@@ -133,19 +134,14 @@ class CondGPT(pl.LightningModule):
             predict_R=False,
             R_seq_len=None, # How many bits or *codes to use for R if we are going to predict it
             R_bits=None, # How many *bits or codes to use for R if we are going to predict it
-            metric_R=True, # do R metrics
             R_renorm=True,  #renorm R after unpadding
             R_max=1.3,
-            record_freq=1,
-            pure_mode=False,
+            record_freq=1,           # run generation + emit gen-vs-truth metrics every N val epochs
+            do_metric=True,          # log DarkSHINE generation-vs-truth physics metrics
+            metric_hit_threshold=0.1,# [MeV] cell energy above which a cell is a "hit"
+            downsample_mode='sum',   # 43x43 -> 21x21 crystal aggregation: 'sum' or 'min'
+            convert_to_detector_shape=False,  # if True, generated showers are (N,11,21,21)
             monitor=None,
-            debug_mode=0, # which to plot for the metric
-            # 0: sample v.s. truth: eval performance eval (default)
-            # (1: sample v.s. recon(forward): debug GPT)
-            # 2: sample v.s. reco(forward+codes lookup): debug GPT (recomm.)
-            # (-1: recon(forward) v.s. truth: debug VAE)
-            # -2: reco(forward+codes lookup) v.s. truth: debug VQVAE (recomm.)
-            # (-3: reco(forward+codes lookup) v.s. recon(forward): debug codes lookup)
             use_vq_cond=True,
             ):
         super().__init__()
@@ -170,20 +166,20 @@ class CondGPT(pl.LightningModule):
         for p in self.vq_model.parameters():
             p.requires_grad = False
         self.vq_model.eval()
+        # detector-shape conversion is applied in vq_model.postprocess; push the
+        # flags down so generation (-> sample_fullchain -> postprocess) honours them.
+        self.downsample_mode = downsample_mode
+        self.convert_to_detector_shape = convert_to_detector_shape
+        self.vq_model.downsample_mode = downsample_mode
+        self.vq_model.convert_to_detector_shape = convert_to_detector_shape
         assert self.codebook_size == self.vq_model.n_embed
         # assert sequence_len == self.vq_model.encoder.seq_out # better to check this...
         # assert sequence_len == self.vq_model.decoder.seq_in
         self.sequence_shape=sequence_shape
-        assert len(sequence_shape)+1 in [2,3,4] # shape of codes with batch dimension ; ok now we support ds3
+        assert len(sequence_shape)+1 in [2,3] # (batch + code grid): DarkSHINE uses a 2D (6,6) grid
         sequence_len = reduce(lambda x, y: x*y, sequence_shape)
         self.sequence_len=sequence_len
-        if self.vq_model.is_ds23:
-            if self.vq_model.dataset_name == "darkshine":  # depth, x, y
-                self.input_dim = (11, 43, 43)
-            elif self.vq_model.dataset_name == "2":  # R Z A
-                self.input_dim=(9, 45, 16)
-            else:
-                self.input_dim=(18, 45, 50)
+        self.input_dim = (11, 43, 43)  # DarkSHINE: depth, x, y
 
         if self.predict_R:
             self.bits_per_code = int(math.log2(self.codebook_size))
@@ -197,11 +193,7 @@ class CondGPT(pl.LightningModule):
                 self.R_seq_len = math.ceil(self.R_bits/self.bits_per_code)
             # 
             print(f"Using {self.R_seq_len} initial sequence elements to predict R of {self.R_bits} bits")
-            if self.vq_model.layer_seg:
-                print(f"Layer-norm R enabled, in total ({len(self.vq_model.layer_seg)}+1) * {self.R_seq_len} sequence elements")
-                sequence_len = sequence_len + self.R_seq_len * (len(self.vq_model.layer_seg)+1)
-            else:
-                sequence_len = sequence_len + self.R_seq_len
+            sequence_len = sequence_len + self.R_seq_len
 
         self.config = GPTConfig(
                 codebook_size=codebook_size, sequence_len=sequence_len,
@@ -218,13 +210,12 @@ class CondGPT(pl.LightningModule):
             self.register_module('proj', None)
 
         self.n_embd=n_embd
-        self.R_renorm=R_renorm if self.vq_model.is_ds23 else False
+        self.R_renorm=R_renorm
         self.R_max=R_max
         self.record_freq=record_freq
-        self.on_record=False
-        self.pure_mode=pure_mode
-        self.debug_mode=debug_mode
-        assert debug_mode in [0,1,2,-1,-2,-3]
+        self.do_metric=do_metric
+        self.metric_hit_threshold=metric_hit_threshold
+        self._val_metrics=None
 
         # loopback test of R coding (test within the representable [0, R_max) range)
         s=torch.rand([1000,1000]) * self.R_max
@@ -278,10 +269,7 @@ class CondGPT(pl.LightningModule):
             batch['gpt_cond'] = batch['log_E_inc']
         else:
             if not self.use_vq_cond: # allow gpt-cond is different as vq
-                if not self.vq_model.is_ds23:
-                    raise NotImplementedError("Error: for ds1 must use E_inc binned as it-is. Not support rebin")
-                else:
-                    batch['gpt_cond'] = ((torch.log10(self.batch['E_inc'].squeeze(-1))-3)/3*self.cond_bins).long() 
+                batch['gpt_cond'] = ((torch.log10(self.batch['E_inc'].squeeze(-1))-3)/3*self.cond_bins).long()
             else:
                 # use directly VQ cond
                 batch['gpt_cond']=batch['cond']
@@ -308,18 +296,8 @@ class CondGPT(pl.LightningModule):
             raise NotImplementedError(f"Wrong R_true dimension {batch['gpt_R_true'].shape}")
         # N,R,Z,A or N,X --> N,Z
         
-        # convert R into codes
-        if not self.vq_model.layer_seg: # no seg --> only one R
-            batch['R_codes'] = self.convertR(batch['gpt_R_true'])
-        else:
-            batch['gpt_R_unique_trues'] = batch.pop('R_unique_trues') 
-            batch['gpt_R_unique_trues'] = [R_layer.squeeze().unsqueeze(-1) for R_layer in batch['gpt_R_unique_trues']] # N,R,Z,A or N,X --> N,Z
-            # test adding sum R
-            batch['gpt_R_unique_trues'].insert(0,sum(batch['gpt_R_unique_trues']))
-            batch['R_codes'] = torch.concat(
-                                    [self.convertR(R_layer) 
-                                        for R_layer in batch['gpt_R_unique_trues']
-                                    ], axis=-1)
+        # convert R into codes (single global R for the xyz model)
+        batch['R_codes'] = self.convertR(batch['gpt_R_true'])
         return batch
 
     def postprocess_codes(self, codes): 
@@ -328,40 +306,13 @@ class CondGPT(pl.LightningModule):
 
         ret = {}
         if self.predict_R:
-            if not self.vq_model.layer_seg: # only global R
-                ret['gpt_R_unique_preds'] = self.decodeR(codes[:,:self.R_seq_len]) # GPT_R mustbe 2D
-                codes = codes[:,self.R_seq_len:]
-                # print("DEB1",ret['gpt_R_unique_preds'].shape,codes.shape)
-                ret['R_pred'] = ret['gpt_R_unique_preds'].reshape(
-                    -1 , # batch
-                    *((1,) * (len(self.sequence_shape) +1 )) # latent (1 dim for ds1 and 2 for ds2/3)  + channel (1)
-                    ) # R_pred in vq should be same as input shape # need review.
-            else:
-                ret['gpt_R_unique_preds']=[] # use layer norm R
-                for _ in range(len(self.vq_model.layer_seg)+1):
-                    dcodes=codes[:,:self.R_seq_len]
-                    ret['gpt_R_unique_preds'].append(self.decodeR(dcodes))  
-                    # decodeR could handle multiR but for easily interleave, process one by one
-                    codes = codes[:,self.R_seq_len:]
-                R_sum = ret['gpt_R_unique_preds'][0]
-                R_layers = ret['gpt_R_unique_preds'][1:]
-                R_sum_unorm = sum(R_layers)
-                R_factor=torch.nan_to_num(R_sum/R_sum_unorm,nan=1)
-                R_layers = [R_layer*R_factor for R_layer in R_layers]
-                # print("R SHAPE", self.vq_model.layer_seg, len(R_layers),R_layers[0].shape,R_layers[-1].shape)
-                # print("R VALUE", R_layers[0],R_layers[-1])
-                assert R_layers[0].dim()==2 # (N,Z)
-                if self.vq_model.is_ds23:
-                    # (N,Z) --> (N,1,Z,1)
-                    # later can use vq_model func do that
-                    # ret['R_pred'] = torch.cat(R_layers,dim=1).unsqueeze(-2).unsqueeze(-1).expand(ret['R_pred'].shape[0],*self.input_dim)
-                    # need list
-                    # R_4Dim = torch.cat(R_layers,dim=1).unsqueeze(-2).unsqueeze(-1)
-                    # assert R_4Dim.dim()==4
-                    R_4Dim = [ R.unsqueeze(-2).unsqueeze(-1) for R in R_layers ]
-                    ret['R_pred'] = self.vq_model.interleaveR(R_4Dim)
-                else:
-                    ret['R_pred'] = self.vq_model.interleaveR(R_layers)
+            # single global R: the first R_seq_len codes encode R, the rest are the code grid.
+            ret['gpt_R_unique_preds'] = self.decodeR(codes[:,:self.R_seq_len]) # GPT_R mustbe 2D
+            codes = codes[:,self.R_seq_len:]
+            ret['R_pred'] = ret['gpt_R_unique_preds'].reshape(
+                -1 , # batch
+                *((1,) * (len(self.sequence_shape) +1 )) # 2D latent grid + channel (1)
+                ) # R_pred broadcasts over the decoded shower
 
         # recover shape
         ret['codes_pred'] = self.unflatten_codes(codes)
@@ -407,102 +358,37 @@ class CondGPT(pl.LightningModule):
         logits, loss = self.trainval_step(batch, batch_idx, split='train')
         return loss
     
+    # ----------------------------------------------------- physics metrics
+    def _metric_epoch(self):
+        # generation is the expensive part; only run it every record_freq epochs.
+        return (self.do_metric
+                and (not self.trainer.sanity_checking)
+                and (self.current_epoch % self.record_freq == 0))
+
+    def on_validation_epoch_start(self):
+        if self._metric_epoch():
+            self._val_metrics = ShowerMetrics(self.downsample_mode, self.metric_hit_threshold)
+        else:
+            self._val_metrics = None
+
     @torch.no_grad()
     def validation_step(self, batch, batch_idx):
         logits, loss = self.trainval_step(batch, batch_idx, split='val')
 
-        # generate some test pattern
-        if      not self.pure_mode \
-                and (not self.trainer.sanity_checking) \
-                and self.current_epoch % self.record_freq == 0:
-            self.on_record=True
-            self.vq_model.on_record=True
-            self.vq_model.do_metric=True
-            self.vq_model.do_more_metric=True
-
-            batch=self.preprocess(batch)
-            R_true = batch['gpt_R_true']
-            print()
-            if self.vq_model.is_ds23:
-                R_true=R_true.unsqueeze(-2).unsqueeze(-1)
-                
-            # R_true=batch.pop("R_true")
-            # isolate the conditions from batch so that ensure it sees nothing truth!
-            # cond_gpt = batch['gpt_cond'] 
-            # cond_vq = batch['cond']
-            
-            # generation mode
-            gen_post = self.sample_fullchain(batch)
-
-            # reco mode -- only test the forward step without codes lookup
-            # add R_true temporarily as 
-            batch["R_true"]=R_true
-            # print("R_true",R_true[0,0],R_true[0,20],R_true.sum())
-            r=self.vq_model(batch,test_code=True)
-            # print("DEBUG f1 indicies",r["indices"][100,15],r["indices"][100,21])
-            # print("DEBUG f1 R_true",batch["R_true"][100,...].sum())
-            reco_post1=self.vq_model.postprocess(batch, r, renorm=self.R_renorm, force_pred=False)
-            # reco_post1=self.vq_model.postprocess(batch, self.vq_model(batch,test_code=True), renorm=self.R_renorm, force_pred=False) # test code loopback
-            del batch["R_true"]
-
-            # reco mode -- fullinclude codes lookup
-            # codes = self.vq_model.predict_codes(batch)['min_encoding_indices']
-            # codes = codes.reshape(batch['E_inc'].shape[:1] + (-1,)) # (*, H*W)
-            codes = self.vq_model.encode_codes(batch['pixels_R'], batch['cond'])
-            # print("codes''[0]",codes[0,])
-            # print("codes''[1]",codes[1,...])
-            codes = self.flatten_codes(codes)
-            codes = torch.cat([batch['R_codes'], codes], axis=1) # (*, R_len + H*W)
-            reco=self.postprocess_codes(codes)
-            # print("DEBUG f2 indicies",reco["codes_pred"][100,15],reco["codes_pred"][100,21])
-            # print("DEBUG f2 R_pred",reco["R_pred"][100,...].sum())
-            # print("codes'**[0]",reco["codes_pred"][0,...])
-            # print("codes'**[1]",reco["codes_pred"][1,...])
-            # print("R_pred2",reco["R_pred"][0,0],reco["R_pred"][0,20],reco["R_pred"].sum())
-            reco_post2 = self.vq_model.decode_codes_fullchain(batch, reco, post=True, renorm=self.R_renorm, force_pred=True) # note, R_pred will be first used is decoder learn_R
-            # print("===================================")
-            # let's accumulate the gen and finally generate sth in the later
-            if self.debug_mode==0:
-                truth_b={ 
-                    "pixels_E_orig":batch["pixels_E_orig"].clone(),
-                    "E_inc":batch["E_inc"].clone(),
-                }
-                self.vq_model.val_accumulate(truth_b, gen_post, do_post=False, renorm=False) # renorm already done in decode_code.
-            elif self.debug_mode==1:
-                reco_b={ 
-                    "pixels_E_orig":reco_post1["pixels_E_pred"].clone(),
-                    "E_inc":batch["E_inc"].clone(),
-                }
-                self.vq_model.val_accumulate(reco_b,gen_post, do_post=False, renorm=False) 
-            elif self.debug_mode==2:
-                reco_b={ 
-                    "pixels_E_orig":reco_post2["pixels_E_pred"].clone(),
-                    "E_inc":batch["E_inc"].clone(),
-                }
-                self.vq_model.val_accumulate(reco_b,gen_post, do_post=False, renorm=False) 
-            elif self.debug_mode==-1:
-                truth_b={ 
-                    "pixels_E_orig":batch["pixels_E_orig"].clone(),
-                    "E_inc":batch["E_inc"].clone(),
-                }
-                self.vq_model.val_accumulate(truth_b,reco_post1, do_post=False, renorm=False) 
-            elif self.debug_mode==-2:
-                truth_b={ 
-                    "pixels_E_orig":batch["pixels_E_orig"].clone(),
-                    "E_inc":batch["E_inc"].clone(),
-                }
-                self.vq_model.val_accumulate(truth_b,reco_post2, do_post=False, renorm=False) 
-            elif self.debug_mode==-3:
-                reco_b={ 
-                    "pixels_E_orig":reco_post1["pixels_E_pred"].clone(),
-                    "E_inc":batch["E_inc"].clone(),
-                }
-                self.vq_model.val_accumulate(reco_b,reco_post2, do_post=False, renorm=False) 
-        else:
-            self.on_record=False
-            self.vq_model.on_record=False
+        # generation metrics: sample showers from the GPT and compare to truth.
+        if self._val_metrics is not None:
+            batch = self.preprocess(batch)
+            gen_post = self.sample_fullchain(batch)   # {'pixels_E_pred': (N,11,43,43), ...}
+            self._val_metrics.update(batch['pixels_E_orig'], gen_post['pixels_E_pred'], batch['E_inc'])
 
         return loss
+
+    def on_validation_epoch_end(self):
+        if self._val_metrics is not None and self._val_metrics.n > 0:
+            # generation is unpaired (independent samples) -> distribution comparison.
+            self._val_metrics.compute_and_log(self, tag='gen',
+                                              epoch=self.current_epoch, paired=False)
+        self._val_metrics = None
 
     def configure_optimizers(self):
         opt = torch.optim.Adam(self.parameters(), lr=self.learning_rate, betas=(0.9, 0.999))
@@ -573,39 +459,3 @@ class CondGPT(pl.LightningModule):
         out = logits.clone()
         out[out < v[:, [-1]]] = -float('Inf')
         return out
-    
-    @torch.no_grad()
-    def log_images(self, batch, inc_calo=True, plot_ema=False, **kwargs): # only_inputs=False, 
-        if True:
-            # this doesn't work for ds1, just kill it for now
-            return {}
-        log = dict()
-        if self.pure_mode: # in gpt training, the image logging also needs sampling so still slow. it will be disabled by the option
-            return log
-        batch=self.preprocess(batch)
-        # cond_gpt = batch['gpt_cond']
-        # cond_vq = batch['cond']
-        post = self.sample_fullchain(batch)
-        # gen = self.sample(cond_gpt)
-        # post = self.vq_model.decode_codes_fullchain(batch, gen, post=True, renorm=self.R_renorm, force_pred=True)
-        # post = self.vq_model.decode_code(batch, gen, renorm=self.R_renorm)
-        # post = self.vq_model.decode_code(q=gen["codes_pred"], cond=cond, R_true=gen["R_pred"]) # note, R_pred will be first used is decoder learn_R
-        post = recursive_to(post , self.device)
-
-        log["references"] = torch.log1p(batch['pixels_E'])/14
-        log["generations"] = torch.log1p(post['pixels_E_pred'])/14
-
-        if inc_calo:
-            log["references_calo"] = self.vq_model.to_calo(batch['pixels_E'], batch['E_inc'])
-            log["generations_calo"] = self.vq_model.to_calo(post['pixels_E_pred'], batch['E_inc'])
-
-        if self.vq_model.use_ema and plot_ema:
-            with self.ema_scope():
-                post = self.sample_fullchain(batch)
-                # gen = self.sample(cond_gpt)
-                # post = self.vq_model.decode_codes_fullchain(batch, gen, post=True, renorm=self.R_renorm, force_pred=True)
-                # post = self.vq_model.decode_code(batch, gen, renorm=self.R_renorm)
-                # post = self.vq_model.decode_code(q=gen["codes_pred"], cond=cond, R_true=gen["R_pred"]) # note, R_pred will be first used is decoder learn_R
-                log["generations_ema"] = torch.log1p(post_ema['pixels_E_pred'])/14
-        
-        return log

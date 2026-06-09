@@ -2,9 +2,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
-from ..layers import PlaneConv
 from ..layers.misc import LogScale
-from ..util import get_activation_by_name, parse_conv_spec
+from ..util import get_activation_by_name, parse_conv_spec, conv_padding
 
 
 class Encoder(nn.Module):
@@ -57,12 +56,12 @@ class Encoder(nn.Module):
             ltype = ltype.strip()
             assert ltype == 'pconv', f"xyz encoder only supports 'pconv' layers, got {ltype!r}"
             k, s, p, w_out = parse_conv_spec(':'.join(spec), w_out)
-            self.layers.append(PlaneConv(w_in, w_out, k=k, stride=s, pad_z=p))
+            self.layers.append(nn.Conv2d(w_in, w_out, kernel_size=k, stride=s, padding=conv_padding(k, p)))
             w_in = w_out
             self.layers.append(activation_class())
 
         # final 1x1 conv to the latent channel dim
-        self.layers.append(PlaneConv(w_in, ch_out, k=(1, 1), stride=(1, 1), pad_z=False))
+        self.layers.append(nn.Conv2d(w_in, ch_out, kernel_size=(1, 1)))
         if output_activation_class is not None:
             self.layers.append(output_activation_class())
 

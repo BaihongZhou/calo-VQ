@@ -23,9 +23,12 @@ model:
   monitor: val/loss
   target: calo_ldm.models.CondGPT
   params:
-    pure_mode: true
     R_renorm: true
-    record_freq: 1000
+    do_metric: true            # log generation-vs-truth physics metrics
+    record_freq: 1             # run generation + emit metrics every N val epochs (gen is the costly part)
+    metric_hit_threshold: 0.1  # [MeV] cell energy above which a cell counts as a hit
+    downsample_mode: sum       # 43x43 -> 21x21 crystal aggregation: sum | min
+    convert_to_detector_shape: false  # true -> generated showers are (N,11,21,21) (ONNX/export)
     codebook_size: 1024
     sequence_shape:
     - 6

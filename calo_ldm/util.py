@@ -128,6 +128,16 @@ def parse_conv_spec(spec, w_out_prev=None):
     return k, s, pad_z, w_out
 
 
+def conv_padding(k, pad):
+    """Translate the conv-spec `pad_z` flag into an nn.Conv2d `padding` arg.
+
+    `pad=True` gives "same"-style zero padding of (k-1)//2 on each image dim
+    (so stride-1 preserves size and k=4/stride=2 halves it); `pad=False` -> 0.
+    `k` is the (k_x, k_y) kernel tuple from `parse_conv_spec`.
+    """
+    return ((k[0] - 1) // 2, (k[1] - 1) // 2) if pad else 0
+
+
 def hinge_d_loss(logits_real, logits_fake):
     loss_real = torch.mean(F.relu(1. - logits_real))
     loss_fake = torch.mean(F.relu(1. + logits_fake))

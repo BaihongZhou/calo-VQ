@@ -3,9 +3,8 @@ from torch import nn
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
-from ..layers import PlaneConv
 from ..layers.misc import LogScale
-from ..util import get_activation_by_name, parse_conv_spec
+from ..util import get_activation_by_name, parse_conv_spec, conv_padding
 
 
 class Discriminator(pl.LightningModule):
@@ -43,12 +42,12 @@ class Discriminator(pl.LightningModule):
             ltype = ltype.strip()
             assert ltype == 'pconv', f"xyz discriminator only supports 'pconv', got {ltype!r}"
             k, s, p, w_out = parse_conv_spec(':'.join(spec), w_out)
-            self.layers.append(PlaneConv(w_in, w_out, k=k, stride=s, pad_z=p))
+            self.layers.append(nn.Conv2d(w_in, w_out, kernel_size=k, stride=s, padding=conv_padding(k, p)))
             w_in = w_out
             self.layers.append(activation_class())
 
         if pooling is None:
-            self.layers.append(PlaneConv(w_in, 1, k=(1, 1), stride=(1, 1), pad_z=False))
+            self.layers.append(nn.Conv2d(w_in, 1, kernel_size=(1, 1)))
         elif pooling == 'max':
             self.layers.append(nn.AdaptiveMaxPool2d((1, 1)))
         elif pooling == 'avg':

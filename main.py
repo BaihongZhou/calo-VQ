@@ -153,10 +153,18 @@ if __name__ == "__main__":
 
         # ---- logger ----
         trainer_kwargs = dict()
-        # PL2: TestTubeLogger was removed upstream. Use CSVLogger (no extra deps).
+        # Default to Weights & Biases in OFFLINE mode (runs anywhere, no login;
+        # data under {logdir}/wandb -- `wandb sync` later, or set mode=online +
+        # entity/project in the config's lightning.logger to stream live).
+        # Native wandb.Histogram / wandb.Image are used by calo_ldm/metrics.py.
         default_logger_cfg = {
-            "target": "pytorch_lightning.loggers.CSVLogger",
-            "params": {"save_dir": logdir, "name": "csv"},
+            "target": "pytorch_lightning.loggers.WandbLogger",
+            "params": {
+                "save_dir": logdir,
+                "project": "calo-vq-darkshine",
+                "name": nowname,
+                "mode": "offline",
+            },
         }
         logger_cfg = lightning_config.get("logger", OmegaConf.create())
         logger_cfg = OmegaConf.merge(default_logger_cfg, logger_cfg)

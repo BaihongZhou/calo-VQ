@@ -3,8 +3,7 @@ from torch import nn
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
-from ..layers import PlaneConv, PlaneConvTranspose
-from ..util import get_activation_by_name, parse_conv_spec, load_geom_mask
+from ..util import get_activation_by_name, parse_conv_spec, conv_padding, load_geom_mask
 
 
 class Decoder(pl.LightningModule):
@@ -68,9 +67,9 @@ class Decoder(pl.LightningModule):
             ltype = ltype.strip()
             k, s, p, w_out = parse_conv_spec(':'.join(spec), w_out)
             if ltype == 'pconvT':
-                conv = PlaneConvTranspose(w_in, w_out, k=k, stride=s, pad_z=p)
+                conv = nn.ConvTranspose2d(w_in, w_out, kernel_size=k, stride=s, padding=conv_padding(k, p))
             elif ltype == 'pconv':
-                conv = PlaneConv(w_in, w_out, k=k, stride=s, pad_z=p)
+                conv = nn.Conv2d(w_in, w_out, kernel_size=k, stride=s, padding=conv_padding(k, p))
             else:
                 raise AssertionError(f"xyz decoder supports 'pconvT'/'pconv', got {ltype!r}")
             w_in = w_out
@@ -79,10 +78,10 @@ class Decoder(pl.LightningModule):
             self._adaptive_layer = conv
 
         # 1x1 conv to the depth channel dim (logits)
-        self.dec_layers.append(PlaneConv(w_in, ch_out, k=(1, 1), stride=(1, 1), pad_z=False))
+        self.dec_layers.append(nn.Conv2d(w_in, ch_out, kernel_size=(1, 1)))
 
     def get_adaptive_layer_weights(self):
-        return self._adaptive_layer.weights
+        return self._adaptive_layer.weight
 
     def masked_voxel_softmax(self, logits):
         # logits ~ (N, depth, pad_to, pad_to). Softmax over all real voxels per shower.

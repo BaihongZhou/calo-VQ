@@ -22,7 +22,11 @@ model:
   params:
     dataset_name: darkshine
     mask_path: DarkSHINE_data/geom_mask.npy
-    do_metric: false
+    do_metric: true            # log reco-vs-truth physics metrics each val epoch
+    metric_freq: 1             # emit histograms/figure every N val epochs
+    metric_hit_threshold: 0.1  # [MeV] cell energy above which a cell counts as a hit
+    downsample_mode: sum       # 43x43 -> 21x21 crystal aggregation: sum | min
+    convert_to_detector_shape: false  # true -> postprocess output is (N,11,21,21) (ONNX/export)
     embed_dim: 64
     n_embed: 1024
     cond_dim: 1

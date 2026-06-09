@@ -1,215 +1,154 @@
 #!/usr/bin/env python
-from omegaconf import OmegaConf
-from calo_ldm.util import instantiate_from_config
+"""Generate DarkSHINE ECAL showers from a trained stage-2 (CondGPT) model.
 
+The model autoregressively samples a code grid (and the quantised energy ratio R)
+conditioned on the incident energy, then decodes it through the frozen stage-1
+VQ-VAE. Output is written in the same schema as the training file
+`DarkSHINE_data/export.h5`:
+
+    condition  (N, 1)         incident energy [MeV]
+    energy     (N, 43, 43, 11) deposited energy per cell, channels-last
+
+so generated files are drop-in comparable with the real data. (The truth-only
+`label` hit flag is not produced -- it does not exist at generation time.)
+
+Incident energy source:
+  --energy E [--nevts N]   N showers at a constant E_inc = E MeV (default;
+                           DarkSHINE is currently a single 4 GeV point).
+  --cond-file f.h5         draw E_inc by sampling the `condition` column of an
+                           existing HDF5 file (use for multi-energy datasets).
+"""
 import os
 import sys
+import time
 import argparse
+from glob import glob
+
 import torch
 import h5py
 import numpy as np
-from glob import glob
+from omegaconf import OmegaConf
 
-import time
-from torch.distributions.categorical import Categorical
-from torch.distributions.transformed_distribution import TransformedDistribution
-from torch.distributions.uniform import Uniform
-from torch.distributions.transforms import ExpTransform
+from calo_ldm.util import instantiate_from_config
 
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
 torch.set_grad_enabled(False)
 
-LN10=2.30258509299
-DIST={
-    "1_photon":Categorical(probs=torch.tensor([10]*11 + [5,3,2,1])),
-    "1_pion":Categorical(probs=torch.tensor([10]*10 + [9.8,5,3,2,1])),
-    "2":TransformedDistribution(Uniform(3*LN10,6*LN10),ExpTransform()),
-    "3":TransformedDistribution(Uniform(3*LN10,6*LN10),ExpTransform()), # need 10^...; 
-}
 
-PREDEFINED={
-    "1_photon":np.repeat(2**np.arange(8,23),[
-            10000, 10000, 10000, 10000, 10000, 
-            10000, 10000, 10000, 10000,10000, 
-            10000,  5000,  3000,  2000,  1000]),
-    "1_pion":np.repeat(2**np.arange(8,23),[
-            10000, 10000, 10000, 10000, 10000, 
-            10000, 10000, 10000, 10000, 10000,  
-            9800,  5000,  3000,  2000,  1000]),
-}
-
-for v in PREDEFINED.values():
-    np.random.shuffle(v)
-
-def sample_cond(model,particle,batch_size):
-    batch={}
-    if particle in ["2","3"]:
-        batch["E_inc"]=DIST[particle].sample((batch_size,)).unsqueeze(-1).to(model.device)
-    else:
-        batch["E_inc_binned"]=DIST[particle].sample((batch_size,)).unsqueeze(-1).to(model.device)
-        batch["E_inc"]=2**(8+batch["E_inc_binned"])
-
-    batch = model.vq_model.preprocess_cond(batch)
-    batch = model.preprocess_cond(batch)
+def build_cond_batch(model, e_inc):
+    """e_inc: (N,) or (N,1) tensor [MeV] -> batch dict ready for sample_fullchain."""
+    e_inc = e_inc.reshape(-1, 1).float().to(model.device)
+    batch = {"E_inc": e_inc}
+    batch = model.vq_model.preprocess_cond(batch)   # -> log_E_inc, cond
+    batch = model.preprocess_cond(batch)            # -> gpt_cond
     return batch
 
-def sample_cond_direct(model,particle,conds):
-    batch={}
-    if particle in ["2","3"]:
-        batch["E_inc"]=conds.squeeze().unsqueeze(-1).to(model.device)
-    else:
-        batch["E_inc"]=conds.squeeze().unsqueeze(-1).to(model.device)
-        batch["E_inc_binned"]=(torch.log2(batch["E_inc"])-8).long()
 
-    batch = model.vq_model.preprocess_cond(batch)
-    batch = model.preprocess_cond(batch)
-    return batch
+def sample_incident_energies(args, n):
+    if args.cond_file:
+        with h5py.File(args.cond_file, "r") as f:
+            pool = torch.from_numpy(f[args.cond_key][:]).float().reshape(-1)
+        idx = torch.randint(0, pool.shape[0], (n,))
+        return pool[idx]
+    return torch.full((n,), float(args.energy))
 
-def submission_format(particle,showers,incident_energies):
-    if particle in ["2","3"]:
-        dim=45*16*9 if particle=="2" else 45*50*18
-        return {
-                'showers': showers.permute((0,2,3,1)).reshape(-1,dim),
-                'incident_energies': incident_energies,
-                }
-    else:
-        return {
-                'showers': showers,
-                'incident_energies': incident_energies,
-                }
 
-def sample_cond_from_dist(model, particle, N, batch_size, **kws):
-    n_gen = 0
-    incident_energies = []
-    showers = []
-    while n_gen < N:
-        n_gen += batch_size
-        batch = sample_cond(model,particle,batch_size)
-        gen_post = model.sample_fullchain(batch)
-        incident_energies.append(batch['E_inc'].cpu())
-        showers.append(gen_post['pixels_E_pred'].cpu())
-        
-    incident_energies = torch.concat(incident_energies, axis=0)[:N]
-    showers = torch.concat(showers, axis=0)[:N]
-    return submission_format(particle,showers,incident_energies)
+def generate(model, args):
+    showers, incident = [], []
+    n_done = 0
+    while n_done < args.nevts:
+        bs = min(args.batch_size, args.nevts - n_done)
+        e_inc = sample_incident_energies(args, bs)
+        batch = build_cond_batch(model, e_inc)
+        gen = model.sample_fullchain(batch)                 # 'pixels_E_pred' (bs,11,H,H)
+        # channels-first (depth,y,x) -> channels-last (y,x,depth) to match export.h5.
+        # H is 43 (half-cell grid) or 21 (detector shape) per --detector-shape.
+        E = gen["pixels_E_pred"].permute(0, 2, 3, 1).cpu()
+        showers.append(E)
+        incident.append(batch["E_inc"].cpu())
+        n_done += bs
+        print(f"  generated {n_done}/{args.nevts}")
+    return {
+        "condition": torch.cat(incident, 0),                # (N,1)
+        "energy": torch.cat(showers, 0),                    # (N,43,43,11) or (N,21,21,11)
+    }
 
-def sample_cond_from_file(model, particle, batch_size, **kws):
-    showers = []
-    incident_energies = []
-    C=PREDEFINED[particle]
-    nbatches=int(C.shape[-1] / batch_size)
-    if C.shape[-1] % batch_size !=0:
-        nbatches+=1
-    n_gen=0
-    print("Generating based on cond of inputs file...")
-    for i in range(nbatches):
-        _c= C[batch_size*i:batch_size*(i+1)] if batch_size*(i+1)<=C.shape[-1] else C[batch_size*i:None]
-        c=torch.from_numpy(_c)
-        conds = sample_cond_direct(model,particle,c) # convert to proper format
-        # gen
-        gen_post = model.sample_fullchain(conds)
-        n_gen+=conds['E_inc'].shape[-1]
-        #
-        incident_energies.append(conds['E_inc'].cpu())
-        showers.append(gen_post['pixels_E_pred'].cpu())
-
-    print(f"Gen:{n_gen}")
-    incident_energies = torch.concat(incident_energies, axis=0)
-    showers = torch.concat(showers, axis=0)
-    return submission_format(particle,showers,incident_energies)
 
 def sanity_check(data):
-    incident_energies = data['incident_energies']
-    showers = data['showers']
-    print(f"--> cond shape {incident_energies.shape}, E shape {showers.shape}")
-    print(f"--> Emin {torch.min(showers)}, Emax {torch.max(showers)}, C min {torch.min(incident_energies)}, Cmax {torch.max(incident_energies)}")
-    print(f"--> Etot min {torch.min(showers.sum(axis=(-1)))}, Etot max {torch.max(showers.sum(axis=(-1)))}, Etot/C min {torch.min(showers.sum(axis=(-1))[:,None] / incident_energies)}, Etot/C max {torch.max(showers.sum(axis=(-1))[:,None] / incident_energies)}")
-    return True
+    E = data["energy"]
+    C = data["condition"]
+    Etot = E.flatten(1).sum(1)
+    print(f"--> events {E.shape[0]}, energy shape {tuple(E.shape)}, condition shape {tuple(C.shape)}")
+    print(f"--> E_inc [{C.min():.1f}, {C.max():.1f}] MeV")
+    print(f"--> E_tot [{Etot.min():.1f}, {Etot.max():.1f}] MeV, R=E_tot/E_inc "
+          f"[{(Etot / C.reshape(-1)).min():.2e}, {(Etot / C.reshape(-1)).max():.2e}]")
+    print(f"--> E_min {E.min():.3e}, E_max {E.max():.3e} (energies non-negative: {bool(E.min() >= 0)})")
+
+
+def load_model(model_dir, checkpoint, device):
+    config_files = sorted(glob(os.path.join(model_dir, "configs", "*.yaml")))
+    print("Loading config files:", config_files)
+    config = OmegaConf.merge(*[OmegaConf.load(c) for c in config_files])
+    model = instantiate_from_config(config["model"])
+
+    ckpt_path = (os.path.join(model_dir, "checkpoints", "last.ckpt")
+                 if checkpoint == "auto"
+                 else os.path.join(model_dir, "checkpoints", checkpoint))
+    print("Loading checkpoint:", ckpt_path)
+    ckpt = torch.load(ckpt_path, map_location="cpu")
+    model.load_state_dict(ckpt["state_dict"], strict=False)
+    for p in model.parameters():
+        p.requires_grad = False
+    return model.to(device).eval()
+
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--out', required=True, help='Output file (default latent.h5 for encode, reco.h5 for decode)')
-    parser.add_argument('--model', required=True, help='Path the the model log directory')
-    parser.add_argument('--type', required=True, choices=['1_photon', '1_pion', '2', '3'], help='Particle type')
-    parser.add_argument('--checkpoint', default='auto', help='Checkpoint file to run on, relative to the model checkpoints/ dir. Default: last.ckpt')
-    parser.add_argument('--batch-size', default=512, type=int, help='batch size')
-    parser.add_argument('--nevts', default=100000, type=int, help="N generated. Should not be used when condition file is given")
-    parser.add_argument('--device', default=None, help='torch device to run on')
-    parser.add_argument('--debug', action="store_true", help="Debug mode")
-    parser.add_argument('--timing', action="store_true", help="timing mode, no save data and run multiple times")
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--out", required=True, help="output HDF5 file")
+    parser.add_argument("--model", required=True, help="stage-2 model log directory (has configs/ and checkpoints/)")
+    parser.add_argument("--checkpoint", default="auto", help="checkpoint name under checkpoints/ (default: last.ckpt)")
+    parser.add_argument("--energy", type=float, default=4000.0, help="constant incident energy [MeV] when --cond-file is not given")
+    parser.add_argument("--cond-file", default=None, help="HDF5 file to sample incident energies from")
+    parser.add_argument("--cond-key", default="condition", help="dataset key for incident energy in --cond-file")
+    parser.add_argument("--nevts", type=int, default=10000, help="number of showers to generate")
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--device", default=None, help="torch device (default: cuda if available else cpu)")
+    parser.add_argument("--detector-shape", action="store_true",
+                        help="export at real detector resolution (N,21,21,11) instead of the "
+                             "(N,43,43,11) half-cell training grid")
+    parser.add_argument("--mode", default="sum", choices=["sum", "min"],
+                        help="crystal aggregation when --detector-shape: 'sum' or 'min' (4*min)")
     args = parser.parse_args()
 
-    if args.device:
-        device = args.device
-    print("Will run on device:", device)
+    device = args.device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print("Running on device:", device)
 
-    if not args.debug and os.path.exists(args.out):
+    if os.path.exists(args.out):
         print(f"Output file {args.out} already exists! Abort.")
         sys.exit(1)
 
-    config_files = list(sorted(glob(os.path.join(args.model, 'configs', '*.yaml'))))
-    print("Loading from config files:", config_files)
-    config = OmegaConf.merge(*[OmegaConf.load(c) for c in config_files])
-    model = instantiate_from_config(config['model'])
-
-    if args.checkpoint=="auto":
-        ckpts=list(glob(os.path.join(args.model, 'checkpoints',"e*.ckpt")))
-        ckpt_path = sorted(ckpts)[-1]
+    model = load_model(args.model, args.checkpoint, device)
+    if args.detector_shape:
+        # postprocess (inside sample_fullchain) reads vq_model's flags
+        model.convert_to_detector_shape = True
+        model.downsample_mode = args.mode
+        model.vq_model.convert_to_detector_shape = True
+        model.vq_model.downsample_mode = args.mode
+        print(f"Output: detector shape (N,21,21,11), downsample mode={args.mode}")
     else:
-        ckpt_path = os.path.join(args.model, 'checkpoints', args.checkpoint)
-    print("Loading checkpoint from", ckpt_path)
-    ckpt = torch.load(ckpt_path)
-
-    model.load_state_dict(ckpt['state_dict'],strict=False)
-    for p in model.parameters():
-        p.requires_grad = False
-    print(model)
-    model.to(device)
-    model.eval()
-
-    if args.timing:
-        for i in range(3):
-            start = time.time()
-            if args.type in ["2","3"]:
-                ret = sample_cond_from_dist(model, 
-                                particle=args.type, 
-                                batch_size=args.batch_size, 
-                                N=args.nevts, 
-                                debug=args.debug)
-            else:
-                ret = sample_cond_from_file(model, 
-                                particle=args.type, 
-                                batch_size=args.batch_size, 
-                                debug=args.debug)
-            end = time.time()
-            nevts=ret['incident_energies'].shape[0]
-            print(f"Run {i}: Generation time (no DL) total {end - start:.3}s, {nevts/1000:.0}k, bs={args.batch_size}, Per shower {(end - start)/nevts*1000:.5}ms")
-        exit()
+        print("Output: half-cell grid (N,43,43,11)")
 
     start = time.time()
-    if args.type in ["2","3"]:
-        result = sample_cond_from_dist(model, 
-                        particle=args.type, 
-                        batch_size=args.batch_size, 
-                        N=args.nevts, 
-                        debug=args.debug)
-    else:
-        result = sample_cond_from_file(model, 
-                            particle=args.type, 
-                            batch_size=args.batch_size, 
-                            debug=args.debug)
-    end = time.time()
+    result = generate(model, args)
+    dt = time.time() - start
+    n = result["condition"].shape[0]
+    print(f"Generation time {dt:.2f}s total, {dt / n * 1000:.3f} ms/shower")
 
-    print(f"Generation time (no DL) total {end - start:.3}s, Per shower {(end - start)/len(result['incident_energies'])*1000:.5}ms")
-    
-    assert sanity_check(result)
+    sanity_check(result)
 
-    print("Saving result to", args.out)
-    with h5py.File(args.out, 'w') as fout:
+    print("Saving to", args.out)
+    with h5py.File(args.out, "w") as fout:
         for k, v in result.items():
-            print('\t'+k, v.shape)
-            fout[k] = v
+            print(f"\t{k}", tuple(v.shape))
+            fout[k] = v.numpy()
     print("Done.")
-    sys.exit()
-
-    

@@ -8,6 +8,8 @@ from torch.optim.lr_scheduler import LambdaLR
 from calo_ldm.layers import VectorQuantizer
 from calo_ldm.util import instantiate_from_config, load_geom_mask
 from calo_ldm.ema import LitEma
+from calo_ldm.metrics import ShowerMetrics
+from calo_ldm.geometry import downsample_to_crystals
 
 
 class VQModel(pl.LightningModule):
@@ -45,10 +47,11 @@ class VQModel(pl.LightningModule):
                  reco_normalization='R',   # compare pixels in R (sum-to-R) space
                  disc_normalization='U',   # discriminator sees U (sum-to-1) space
                  sane_index_shape=True,
-                 do_metric=False,          # xyz physics metrics are future work (see Agent_md)
-                 do_more_metric=False,
-                 record_freq=1,
-                 metric_evts=10000,
+                 do_metric=True,           # log DarkSHINE reco-vs-truth physics metrics
+                 metric_freq=1,            # emit histogram/figure metrics every N val epochs
+                 metric_hit_threshold=0.1, # [MeV] cell energy above which a cell is a "hit"
+                 downsample_mode='sum',    # 43x43 -> 21x21 crystal aggregation: 'sum' or 'min'
+                 convert_to_detector_shape=False,  # if True, postprocess output is (N,11,21,21)
                  **unused):                # absorb any leftover config keys
         super().__init__()
         # PL2: two optimizers (AE + discriminator) -> manual optimization.
@@ -57,21 +60,16 @@ class VQModel(pl.LightningModule):
         self.embed_dim = embed_dim
         self.n_embed = n_embed
         self.dataset_name = dataset_name
-        # is_ds23 == "treated as 2D-image + channel" (always true for the xyz model).
-        self.is_ds23 = True
-        # no per-layer (layer-wise) R normalization in the xyz model: single global R.
-        self.layer_seg = None
-        self.input_dim = (11, 43, 43)
-        self.raw_input_dim = (11, 43, 43)
 
         self.reco_normalization = reco_normalization
         self.disc_normalization = disc_normalization
 
         self.do_metric = do_metric
-        self.do_more_metric = do_more_metric
-        self.record_freq = record_freq
-        self.metric_evts = metric_evts
-        self.on_record = False
+        self.metric_freq = metric_freq
+        self.metric_hit_threshold = metric_hit_threshold
+        self.downsample_mode = downsample_mode
+        self.convert_to_detector_shape = convert_to_detector_shape
+        self._val_metrics = None
 
         # fixed geometry mask (depth, x, y) = (11, 43, 43); same for every shower.
         # persistent=False: constant derived from mask_path, kept out of the checkpoint.
@@ -225,6 +223,12 @@ class VQModel(pl.LightningModule):
         post['pixels_E_pred'] = post['pixels_R_pred'] * Einc[..., None, None]
         if renorm:
             post = self.renorm_R(post)
+        if self.convert_to_detector_shape:
+            # map the (N,11,43,43) half-cell grid back to real detector crystals
+            # (N,11,21,21). This is the ONNX / export output shape.
+            for k in ('pixels_U_pred', 'pixels_R_pred', 'pixels_E_pred'):
+                if k in post:
+                    post[k] = downsample_to_crystals(post[k], self.downsample_mode)
         return post
 
     @torch.no_grad()
@@ -237,11 +241,28 @@ class VQModel(pl.LightningModule):
                 post[k] = post[k].detach() / factor
         return post
 
-    # placeholder so stage-2 GPT (non-pure validation) can call it; xyz physics
-    # metrics are future work (see Agent_md plan).
+    # ----------------------------------------------------- physics metrics
+    def _metric_epoch(self):
+        # whether to emit histogram/figure metrics this validation epoch
+        return self.do_metric and (self.current_epoch % self.metric_freq == 0)
+
+    def on_validation_epoch_start(self):
+        if self._metric_epoch():
+            self._val_metrics = ShowerMetrics(self.downsample_mode, self.metric_hit_threshold)
+        else:
+            self._val_metrics = None
+
     @torch.no_grad()
-    def val_accumulate(self, *args, **kwargs):
-        return False
+    def _accumulate_metrics(self, b, pred):
+        # stage-1 reco: pred is the reconstruction of the same shower (paired).
+        if self._val_metrics is not None:
+            self._val_metrics.update(b['pixels_E_orig'], pred['pixels_E_pred'], b['E_inc'])
+
+    def on_validation_epoch_end(self):
+        if self._val_metrics is not None and self._val_metrics.n > 0:
+            self._val_metrics.compute_and_log(self, tag='reco',
+                                              epoch=self.current_epoch, paired=True)
+        self._val_metrics = None
 
     # -------------------------------------------------------------- training
     def get_last_layer(self):
@@ -295,6 +316,7 @@ class VQModel(pl.LightningModule):
         del log_ae[f"val{suffix}/rec_loss"]
         self.log_dict(log_ae, prog_bar=False, logger=True, on_step=False, on_epoch=True)
         self.log_dict(log_disc, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self._accumulate_metrics(b, pred)
         return rec_loss
 
     def configure_optimizers(self):
