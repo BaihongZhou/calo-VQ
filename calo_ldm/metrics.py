@@ -112,7 +112,8 @@ def compute_observables(E, E_inc, mask, hit_threshold=0.1):
     dx = x[None, :, None] - x_cog[:, None, None]          # (N, H, 1)
     dy = y[None, None, :] - y_cog[:, None, None]          # (N, 1, W)
     r = torch.sqrt(dx ** 2 + dy ** 2)                    # (N, H, W)
-    rbin = r.long().clamp(max=_RADIAL_BINS - 1)
+    r = torch.nan_to_num(r, nan=0.0, posinf=float(_RADIAL_BINS - 1), neginf=0.0)
+    rbin = r.long().clamp(min=0, max=_RADIAL_BINS - 1)
     radial_E = torch.zeros(N, _RADIAL_BINS, device=E.device, dtype=E.dtype)
     radial_E.scatter_add_(1, rbin.reshape(N, -1), E_xy.reshape(N, -1))
 

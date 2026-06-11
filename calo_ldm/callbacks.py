@@ -78,19 +78,7 @@ class CUDACallback(Callback):
     # `outputs`. Made CPU-safe so it works on machines without CUDA (e.g. macOS).
     def on_train_epoch_start(self, trainer, pl_module):
         self.start_time = time.time()
-        if torch.cuda.is_available():
-            device = pl_module.device
+        device = pl_module.device
+        if device.type == 'cuda':
             torch.cuda.reset_peak_memory_stats(device)
             torch.cuda.synchronize(device)
-
-    def on_train_epoch_end(self, trainer, pl_module):
-        epoch_time = time.time() - self.start_time
-        rank_zero_info(f"Mem count: {self.getMem():.1f} GB")
-        rank_zero_info(f"Epoch time: {epoch_time:.2f} seconds")
-        if torch.cuda.is_available():
-            device = pl_module.device
-            torch.cuda.synchronize(device)
-            max_memory = torch.cuda.max_memory_allocated(device) / 2 ** 20
-            rank_zero_info(f"Peak GPU memory {max_memory:.2f}MiB")
-
-

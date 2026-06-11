@@ -194,6 +194,9 @@ class CondGPT(pl.LightningModule):
             # 
             print(f"Using {self.R_seq_len} initial sequence elements to predict R of {self.R_bits} bits")
             sequence_len = sequence_len + self.R_seq_len
+            unused_r_bits = self.R_seq_len * self.bits_per_code - self.R_bits
+            self.R_first_token_bins = 2 ** (self.bits_per_code - unused_r_bits)
+            assert 0 < self.R_first_token_bins <= self.codebook_size
 
         self.config = GPTConfig(
                 codebook_size=codebook_size, sequence_len=sequence_len,
@@ -260,6 +263,7 @@ class CondGPT(pl.LightningModule):
         for i in range(self.R_seq_len-1):
             R_pred = R_pred << self.bits_per_code
             R_pred = R_pred | codes[:,:,i+1]
+        R_pred = torch.clamp(R_pred, 0, 2**self.R_bits - 1)
         return (R_pred.double() / 2**self.R_bits * self.R_max).float().reshape(_codes.shape[0],-1) # GPT_R mustbe 2D
 
     def preprocess_cond(self,batch):
@@ -348,9 +352,9 @@ class CondGPT(pl.LightningModule):
         logits, loss = self(batch['gpt_cond'], idx, targets)
 
         if split == 'train':
-            self.log(f"train/loss", loss, on_step=True, on_epoch=True)
+            self.log(f"train/loss", loss, on_step=True, on_epoch=True, sync_dist=True)
         else:
-            self.log(f"{split}/loss", loss, on_step=False, on_epoch=True)
+            self.log(f"{split}/loss", loss, on_step=False, on_epoch=True, sync_dist=True)
 
         return logits, loss
 
@@ -428,6 +432,9 @@ class CondGPT(pl.LightningModule):
                 logits = self.gpt.sample(x_cond)
                 # pluck the logits at the final step and scale by temperature
                 logits = logits[:, -1, :] / temperature
+                if (self.predict_R and k == 0
+                        and self.R_first_token_bins < self.codebook_size):
+                    logits[:, self.R_first_token_bins:] = -float('Inf')
                 # optionally crop probabilities to only the top k options
                 if top_k is not None:
                     logits = self.top_k_logits(logits, top_k)

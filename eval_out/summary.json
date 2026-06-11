@@ -1,0 +1,17 @@
+{
+  "eval/E_tot_truth": 3899.226318359375,
+  "eval/E_tot_pred": 36.77082061767578,
+  "eval/E_tot_ratio": 0.009430286322325437,
+  "eval/R_truth": 0.0009748066659085453,
+  "eval/R_pred": 0.009192705154418945,
+  "eval/R_ratio": 9.43028548727773,
+  "eval/hits_truth": 206.0991973876953,
+  "eval/hits_pred": 57.351600646972656,
+  "eval/hits_ratio": 0.27827182916723336,
+  "eval/z_cog_truth": 1.7202253341674805,
+  "eval/z_cog_pred": 3.7804582118988037,
+  "eval/z_cog_ratio": 2.197652910238293,
+  "eval/z_sigma_truth": 1.2413581609725952,
+  "eval/z_sigma_pred": 2.349379062652588,
+  "eval/z_sigma_ratio": 1.8925876000298465
+}

@@ -171,6 +171,26 @@ either 43×43 or 21×21 (already-detector-shape files pass through).
 with your entity/project). Physics metrics use native `wandb.Histogram`/`wandb.Image`
 when wandb is active, else the overview figure falls back to `{log_dir}/metrics/`.
 
+## Current DarkSHINE optimization note (2026-06-11)
+
+A full 200-epoch baseline (`logs/2026-06-10T06-38-39_dss1` -> `logs/2026-06-10T11-41-38_dss2`) showed that the first DarkSHINE optimization pass did **not** learn a useful shower shape. The main failure was in Step 1, not only in the GPT prior:
+
+- The old Step-1 config trained reconstruction in `R = E/E_inc` space with L2. Since DarkSHINE `R ~= 9.7e-4`, the pixel L2 loss was `O(1e-8)` and was dominated by codebook/GAN dynamics.
+- The old Step-1 checkpoint used only 6 codes in a validation batch, with perplexity about 4.6. Its detector-level shape was over-broad: `E_max_frac` about 0.5x truth and width ratios about 1.6-1.8x truth, even though total energy/R were forced correct by construction.
+- The old Step-2 free sampler also let the first R token use all 1024 codebook IDs, but with `R_bits=16` and 10 bits per code only 64 first-token values are legal. This could produce `R_pred > R_max`.
+
+Conservative fix now in the configs/code:
+
+- Step 1 trains shape with `reco_normalization: U`, `pixel_power: 1`, `disc_start: 10000`, and `disc_weight: 0.2`.
+- Step 2 masks invalid first R-token logits during sampling and clamps decoded R integers into the representable range.
+- `main.py` copies top-level `model.monitor` onto the instantiated model so existing YAML monitor fields drive `ModelCheckpoint`.
+- `diagnostics/darkshine_diagnostics.py` records the failed baseline, gate metrics, and R-sampling range checks.
+
+Use a staged gate before spending a full training budget: train optimized Step 1 for 30 epochs on two A800 GPUs, require at least 32 validation-batch unique codes and perplexity at least 16 plus materially improved detector-shape observables, then continue Step 1/Step 2 to 200 epochs only if the gate passes.
+
+Gate result: `logs/2026-06-11T06-11-08_dss1_u_l1_gate` completed 30 epochs and failed the gate. `last.ckpt` reached `val/rec_loss=1.90604`, but `/tmp/calo-vq-gate-diagnostics.json` shows only 2 validation-batch unique codes, perplexity 1.97, `E_max_frac` ratio 0.0024, `hits` ratio 23.7, and width ratios `z/x/y = 2.27/7.77/7.98`. Stop before Step 2/full training for this pass. The next pass should address sparse shower occupancy and codebook collapse directly, for example with a hit/no-hit head or weighted sparse reconstruction, explicit codebook usage pressure/reinitialization, and possibly a less compressed latent grid.
+
+
 ## Notes
 
 The original cylindrical published checkpoints (`models/`) and paper-ds2 data

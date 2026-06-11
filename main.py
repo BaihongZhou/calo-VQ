@@ -49,13 +49,13 @@ def get_parser(**parser_kwargs):
     parser.add_argument("-s", "--seed", type=int, default=23, help="seed for seed_everything")
     parser.add_argument("-f", "--postfix", type=str, default="", help="post-postfix for default name")
     parser.add_argument("-l", "--logdir", type=str, default="logs", help="directory for logging")
-    parser.add_argument("--scale_lr", type=str2bool, nargs="?", const=True, default=True,
+    parser.add_argument("--scale_lr", type=str2bool, nargs="?", const=True, default=False,
                         help="scale base-lr by ngpu * batch_size * n_accumulate")
     # PL2: `--gpus` no longer exists on Trainer. Keep it for CLI compatibility and map
     # it onto accelerator/devices ourselves. None/0 -> CPU.
     parser.add_argument("--gpus", type=str, default=None,
                         help="comma-separated GPU ids or a count. Omit / 0 for CPU.")
-    parser.add_argument("--max_epochs", type=int, default=None,
+    parser.add_argument("--max_epochs", type=int, default=200,
                         help="convenience override for lightning.trainer.max_epochs")
     return parser
 
@@ -150,6 +150,9 @@ if __name__ == "__main__":
 
         # ---- model ----
         model = instantiate_from_config(config.model)
+        if config.model.get("monitor", None) is not None:
+            # Keep compatibility with configs that put monitor next to target/base_learning_rate.
+            model.monitor = config.model.monitor
 
         # ---- logger ----
         trainer_kwargs = dict()
@@ -223,11 +226,6 @@ if __name__ == "__main__":
 
         # ---- data ----
         data = instantiate_from_config(config.data)
-        data.prepare_data()
-        data.setup()
-        print("#### Data #####")
-        for k in data.datasets:
-            print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
 
         # ---- learning rate ----
         bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate

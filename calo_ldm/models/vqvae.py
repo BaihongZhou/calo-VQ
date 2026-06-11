@@ -190,7 +190,7 @@ class VQModel(pl.LightningModule):
         R_true = (pixels_R * mask).sum(axis=(-1, -2, -3), keepdims=True)  # (N,1,1,1)
         batch['R_true'] = R_true
         # U: normalised shower shape, sums to 1 over real cells.
-        batch['pixels_U'] = torch.nan_to_num(pixels_R / R_true, nan=0.0)
+        batch['pixels_U'] = torch.nan_to_num(pixels_R / R_true.clamp(min=1e-12), nan=0.0, posinf=0.0, neginf=0.0)
         batch['pixels_R'] = pixels_R
         batch['pixels_E'] = batch['pixels_E_orig']
         return batch
@@ -281,7 +281,7 @@ class VQModel(pl.LightningModule):
         self.manual_backward(aeloss)
         opt_ae.step()
         self.untoggle_optimizer(opt_ae)
-        self.log_dict(log_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.log_dict(log_ae, prog_bar=True, logger=True, on_step=True, on_epoch=False, sync_dist=True)
 
         # optimizer 1: discriminator
         self.toggle_optimizer(opt_disc)
@@ -291,7 +291,7 @@ class VQModel(pl.LightningModule):
         self.manual_backward(discloss)
         opt_disc.step()
         self.untoggle_optimizer(opt_disc)
-        self.log_dict(log_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
+        self.log_dict(log_disc, prog_bar=True, logger=True, on_step=True, on_epoch=False, sync_dist=True)
 
         schedulers = self.lr_schedulers()
         if schedulers is not None:
@@ -311,11 +311,11 @@ class VQModel(pl.LightningModule):
         discloss, log_disc = self.loss(b, pred, 1, self.global_step,
                                        last_layer=self.get_last_layer(), split="val" + suffix)
         rec_loss = log_ae[f"val{suffix}/rec_loss"]
-        self.log(f"val{suffix}/rec_loss", rec_loss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-        self.log(f"val{suffix}/aeloss", aeloss, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log(f"val{suffix}/rec_loss", rec_loss, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+        self.log(f"val{suffix}/aeloss", aeloss, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
         del log_ae[f"val{suffix}/rec_loss"]
-        self.log_dict(log_ae, prog_bar=False, logger=True, on_step=False, on_epoch=True)
-        self.log_dict(log_disc, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self.log_dict(log_ae, prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log_dict(log_disc, prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
         self._accumulate_metrics(b, pred)
         return rec_loss
 

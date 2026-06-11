@@ -88,10 +88,9 @@ class Decoder(pl.LightningModule):
         mask = self.mask[None]                                  # (1, 11, P, P)
         neg_inf = torch.finfo(logits.dtype).min
         logits = torch.where(mask, logits, torch.full_like(logits, neg_inf))
-        x = torch.exp(logits.double())
-        x = x * mask                                            # hard-zero padding (guards against all -inf rows)
-        denom = x.sum(axis=(-1, -2, -3), keepdims=True)
-        return (x / denom).float()
+        probs = F.softmax(logits.flatten(start_dim=1).double(), dim=1)
+        probs = probs.reshape_as(logits).to(logits.dtype) * mask
+        return probs.float()
 
     def forward(self, x, cond=None):
         # x ~ (N, ch_in, h, w); cond ~ (N, 1)

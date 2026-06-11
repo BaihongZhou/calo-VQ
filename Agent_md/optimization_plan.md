@@ -1,3 +1,36 @@
+# 2026-06-11 conservative DarkSHINE optimization pass
+
+## Diagnosis
+
+- Baseline runs exist at `logs/2026-06-10T06-38-39_dss1` and `logs/2026-06-10T11-41-38_dss2`, both trained for 200 epochs.
+- Step 1 is the primary failure: old `reco_normalization: R` + L2 makes the reconstruction signal tiny (`R ~= 9.7e-4`, L2 around `1e-8`), so the model collapses to a broad template.
+- Reproduced failed Step-1 numbers on `DarkSHINE_data/j14/export.h5`: 6 unique codes, perplexity 4.6, `E_max_frac` ratio 0.50, `z_sigma` ratio 1.64, `x_sigma` ratio 1.63, `y_sigma` ratio 1.80.
+- Step 2 also had an R sampler bug: with `R_bits=16` and 10-bit code tokens, only 64 first-token values are legal; old sampling allowed all 1024.
+
+## Patch status
+
+- Step 1 config changed to `reco_normalization: U`, `pixel_power: 1`, `disc_start: 10000`, `disc_weight: 0.2`.
+- Step 2 sampling now masks invalid first R-token logits and clamps decoded R integers. Old Step-2 checkpoint now samples `R` within `[0, R_max]` in `diagnostics/darkshine_diagnostics.py`.
+- `main.py` now preserves existing top-level YAML `model.monitor` fields for `ModelCheckpoint`.
+- Added `diagnostics/darkshine_diagnostics.py` for baseline/gate diagnostics and R-sampling assertions.
+
+## Gate plan
+
+- Run optimized Step 1 for 30 epochs on `--gpus 2`.
+- Gate passes only if validation-batch unique code count is at least 32, perplexity is at least 16, and detector-shape observables move materially toward truth versus the failed baseline.
+- If the gate passes, continue Step 1 to 200 epochs, train Step 2 for 200 epochs, generate samples, and run `eval-tools.py`. If it fails, stop before Step 2 and switch to a larger refactor such as sparse/hit-aware output modeling.
+
+## 30-epoch gate result
+
+- Run: `logs/2026-06-11T06-11-08_dss1_u_l1_gate`, trained with `--gpus 2 --max_epochs 30`.
+- Best/last checkpoint: `logs/2026-06-11T06-11-08_dss1_u_l1_gate/checkpoints/last.ckpt` (`val/rec_loss` reached 1.90604 at epoch 29).
+- Diagnostic output: `/tmp/calo-vq-gate-diagnostics.json`.
+- Gate failed: validation-batch code usage collapsed further to 2 unique codes with perplexity 1.97, below the required 32 / 16.
+- Detector-shape diagnostics also failed: `E_max_frac` ratio 0.0024, `hits` ratio 23.7, `z_sigma` ratio 2.27, `x_sigma` ratio 7.77, and `y_sigma` ratio 7.98. Total energy and R remain forced correct by the decoder normalization, so they are not evidence of shape learning.
+- Decision: stop before Step 2/full training. The conservative `U` + L1 + GAN warmup pass is insufficient for DarkSHINE; the next optimization pass should be a larger Step-1 refactor focused on sparse/hit-aware modeling and codebook collapse, e.g. a hit/no-hit occupancy head or weighted sparse reconstruction, stronger codebook usage regularization/reinitialization, and possibly a less over-compressed latent grid.
+
+---
+
 # DarkSHINE Calo-VQ — migration notes & optimization plan
 
 Status after the cylindrical→xyz refactor: both stages run end-to-end on CPU

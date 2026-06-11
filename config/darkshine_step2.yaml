@@ -5,19 +5,35 @@
 data:
   target: calo_ldm.data.DataModuleFromConfig
   params:
-    num_workers: 0
+    num_workers: 16
     pin_memory: false
-    batch_size: 32
+    batch_size: 256
     train:
       target: calo_ldm.data.CaloDarkSHINE
       params:
-        file_path: "DarkSHINE_data/export.h5"
-        load_partial: 512
+        sample_list:
+        - "DarkSHINE_data/j0/export.h5"
+        - "DarkSHINE_data/j1/export.h5"
+        - "DarkSHINE_data/j2/export.h5"
+        - "DarkSHINE_data/j3/export.h5"
+        - "DarkSHINE_data/j4/export.h5"
+        - "DarkSHINE_data/j5/export.h5"
+        - "DarkSHINE_data/j6/export.h5"
+        - "DarkSHINE_data/j7/export.h5"
+        - "DarkSHINE_data/j8/export.h5"
+        - "DarkSHINE_data/j9/export.h5"
+        - "DarkSHINE_data/j10/export.h5"
+        - "DarkSHINE_data/j11/export.h5"
+        - "DarkSHINE_data/j12/export.h5"
+        # load_partial: 512
     validation:
       target: calo_ldm.data.CaloDarkSHINE
       params:
-        file_path: "DarkSHINE_data/export.h5"
-        load_partial: 256
+        sample_list:
+        - "DarkSHINE_data/j13/export.h5"
+        - "DarkSHINE_data/j14/export.h5"
+        - "DarkSHINE_data/j15/export.h5"
+        # load_partial: 256
 model:
   base_learning_rate: 3.0e-06
   monitor: val/loss
@@ -42,12 +58,10 @@ model:
     cond_bins: 0
     vq_config:
       model_config: config/darkshine_step1.yaml
-      checkpoint: OVERRIDE_ME.ckpt
+      checkpoint: logs/2026-06-10T06-38-39_dss1/checkpoints/epoch=000199.ckpt
 lightning:
   trainer:
-    max_epochs: 1
-    limit_train_batches: 4
-    limit_val_batches: 2
-    num_sanity_val_steps: 0
+    max_epochs: 200
     log_every_n_steps: 1
-    enable_progress_bar: false
+    enable_progress_bar: true
+    strategy: 'ddp_find_unused_parameters_true'

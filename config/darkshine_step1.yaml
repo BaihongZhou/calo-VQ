@@ -4,19 +4,34 @@
 data:
   target: calo_ldm.data.DataModuleFromConfig
   params:
-    num_workers: 0
+    num_workers: 16
     pin_memory: false
-    batch_size: 32
+    batch_size: 256
     train:
       target: calo_ldm.data.CaloDarkSHINE
       params:
-        file_path: "DarkSHINE_data/export.h5"
-        load_partial: 512
+        sample_list:
+        - "DarkSHINE_data/j0/export.h5"
+        - "DarkSHINE_data/j1/export.h5"
+        - "DarkSHINE_data/j2/export.h5"
+        - "DarkSHINE_data/j3/export.h5"
+        - "DarkSHINE_data/j4/export.h5"
+        - "DarkSHINE_data/j5/export.h5"
+        - "DarkSHINE_data/j6/export.h5"
+        - "DarkSHINE_data/j7/export.h5"
+        - "DarkSHINE_data/j8/export.h5"
+        - "DarkSHINE_data/j9/export.h5"
+        - "DarkSHINE_data/j10/export.h5"
+        - "DarkSHINE_data/j11/export.h5"
+        - "DarkSHINE_data/j12/export.h5"
+        - "DarkSHINE_data/j13/export.h5"
     validation:
       target: calo_ldm.data.CaloDarkSHINE
       params:
-        file_path: "DarkSHINE_data/export.h5"
-        load_partial: 256
+        sample_list:
+        - "DarkSHINE_data/j14/export.h5"
+        - "DarkSHINE_data/j15/export.h5"
+
 model:
   target: calo_ldm.models.VQModel
   params:
@@ -34,7 +49,7 @@ model:
     - 0
     - 3000
     - 7
-    reco_normalization: R
+    reco_normalization: U
     disc_normalization: U
     encoder_config:
       target: calo_ldm.models.Encoder
@@ -58,12 +73,12 @@ model:
     loss_config:
       target: calo_ldm.losses.CombinedLoss
       params:
-        pixel_power: 2
+        pixel_power: 1
         pixel_weight: 1
         ec_weight: 0.0001
         width_weight: 0.0001
-        disc_start: 0          # exercise the GAN discriminator from step 0
-        disc_weight: 0.8
+        disc_start: 10000      # let shape reconstruction/codebook warm up before GAN pressure
+        disc_weight: 0.2
         codebook_weight: 1.0
         disc_config:
           target: calo_ldm.models.Discriminator
@@ -76,16 +91,14 @@ model:
             - 'pconv : k4 : s2 : p : *2 :'       # (64, 12, 12)
             - 'pconv : k4 : s2 : p : *2 :'       # (128, 6, 6)
         n_embed: 1024
-        reco_normalization: R
+        reco_normalization: U
         disc_normalization: U
         dataset_name: darkshine
   base_learning_rate: 2.0e-06
   monitor: val/rec_loss
 lightning:
   trainer:
-    max_epochs: 1
-    limit_train_batches: 4
-    limit_val_batches: 2
-    num_sanity_val_steps: 0
+    max_epochs: 200
     log_every_n_steps: 1
-    enable_progress_bar: false
+    enable_progress_bar: true
+    strategy: 'ddp_find_unused_parameters_true'

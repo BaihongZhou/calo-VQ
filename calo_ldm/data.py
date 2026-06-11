@@ -26,15 +26,27 @@ class CaloDarkSHINE(Dataset):
     the staggered geometry mask alternates by layer parity, so an x/y flip would
     misalign the data with the mask.
     """
-    def __init__(self, file_path, load_partial=None, key_energy='energy',
-                 key_condition='condition'):
+    def __init__(self, file_path=None, sample_list=None, load_partial=None,
+                 key_energy='energy', key_condition='condition'):
         super().__init__()
-        print(f"Load DarkSHINE from {file_path}", os.path.exists(file_path))
+        if sample_list is None:
+            if file_path is None:
+                raise ValueError("CaloDarkSHINE requires file_path or sample_list")
+            sample_list = [file_path]
+        if isinstance(sample_list, (str, os.PathLike)):
+            sample_list = [sample_list]
         if load_partial:
             print("WARNING: load partial dataset (only for debug!)")
-        with h5py.File(file_path, 'r') as h5_file:
-            E = torch.from_numpy(h5_file[key_energy][:load_partial]).float()      # (N,43,43,11)
-            self._e_inc = torch.from_numpy(h5_file[key_condition][:load_partial]).float()  # (N,1)
+
+        energy_chunks, condition_chunks = [], []
+        for path in sample_list:
+            print(f"Load DarkSHINE from {path}", os.path.exists(path))
+            with h5py.File(path, 'r') as h5_file:
+                energy_chunks.append(torch.from_numpy(h5_file[key_energy][:load_partial]).float())
+                condition_chunks.append(torch.from_numpy(h5_file[key_condition][:load_partial]).float())
+
+        E = torch.cat(energy_chunks)
+        self._e_inc = torch.cat(condition_chunks)
         # channels-last (N, x, y, depth) -> channels-first (N, depth, x, y)
         self._data = E.permute(0, 3, 1, 2).contiguous()
         self.dataset_len = len(self._e_inc)
@@ -57,6 +69,7 @@ class DataModuleFromConfig(pl.LightningDataModule):
         self.batch_size = batch_size
         self.batched_indices = batched_indices
         self.dataset_configs = dict()
+        self.datasets = None
         self.num_workers = num_workers if num_workers is not None else batch_size * 2
         if self.num_workers > 1:
             print("NOTE: multiple dataloader, watch out your memory!!")
@@ -73,6 +86,8 @@ class DataModuleFromConfig(pl.LightningDataModule):
 
 
     def setup(self, stage=None):
+        if self.datasets is not None:
+            return
         self.datasets = dict(
             (k, instantiate_from_config(self.dataset_configs[k]))
             for k in self.dataset_configs)

@@ -4,3 +4,4 @@ __pycache__/
 *_data/
 logs/
 .idea/
+*.h5
