@@ -56,6 +56,26 @@ class Decoder(pl.LightningModule):
         # fixed constant -> persistent=False (recomputed from mask_path each init)
         self.register_buffer('mask', mask.contiguous(), persistent=False)  # (11, pad_to, pad_to) bool
 
+        # Output parameterisation over the real crystals. All three sum to 1 over
+        # real cells; they differ in whether they can emit EXACT zeros:
+        #   'voxel_softmax' (default) - dense & smooth (original); always leaves a
+        #       non-zero halo, so the predicted occupancy is necessarily too high
+        #       and the U-space recon L1 vs the genuinely-sparse truth has an
+        #       irreducible floor.
+        #   'sparsemax'     - Euclidean projection onto the simplex (Martins &
+        #       Astudillo 2016); emits true zeros, gradient has no sqrt singularity.
+        #   'relu_norm'     - relu(logits) renormalised; simplest sparse option.
+        # The network learns to scale the logits, which sets how sparse the output
+        # is -> a learnable occupancy knob (the energy head's own version of the
+        # hit/no-hit gate).
+        assert output_activation in ('voxel_softmax', 'sparsemax', 'relu_norm'), \
+            f"unknown output_activation {output_activation!r}"
+        self.output_activation = output_activation
+        # flat indices of the real cells over (depth, pad_to, pad_to), matching the
+        # flatten(start_dim=1) order used below -> gather/scatter for the sparse path.
+        real_idx = self.mask.reshape(-1).nonzero(as_tuple=False).squeeze(1)
+        self.register_buffer('real_idx', real_idx, persistent=False)
+
         activation_class = get_activation_by_name(activation)
 
         self.dec_layers = nn.Sequential()
@@ -101,6 +121,46 @@ class Decoder(pl.LightningModule):
         probs = probs.reshape_as(logits).to(logits.dtype) * mask
         return probs.float()
 
+    @staticmethod
+    def _sparsemax(z):
+        # z ~ (N, K): Euclidean projection of each row onto the probability simplex
+        # (Martins & Astudillo 2016). Returns p>=0, sum_k p=1, with exact zeros below
+        # the threshold tau. Autograd through sort/cumsum/gather/clamp reproduces the
+        # sparsemax Jacobian (delta_ij - 1/|support| on the support) with no singularity.
+        z_sorted, _ = torch.sort(z, dim=1, descending=True)
+        z_cumsum = z_sorted.cumsum(dim=1)
+        K = z.shape[1]
+        k_arr = torch.arange(1, K + 1, device=z.device, dtype=z.dtype)  # (K,)
+        support = (1.0 + k_arr * z_sorted) > z_cumsum                   # (N, K) bool
+        k_z = support.sum(dim=1, keepdim=True)                          # (N, 1) long, >=1
+        tau = (z_cumsum.gather(1, k_z - 1) - 1.0) / k_z.to(z.dtype)     # (N, 1)
+        return torch.clamp(z - tau, min=0.0)
+
+    @staticmethod
+    def _relu_norm(z, eps=1e-12):
+        # z ~ (N, K): relu then renormalise to sum 1 over real cells. Emits exact zeros
+        # where logits <= 0. Fallback to uniform for the (rare) all-non-positive row so
+        # the output stays a valid distribution instead of 0/0.
+        r = torch.relu(z)
+        s = r.sum(dim=1, keepdim=True)
+        uniform = torch.full_like(r, 1.0 / z.shape[1])
+        return torch.where(s > eps, r / s.clamp(min=eps), uniform)
+
+    def normalize_output(self, logits):
+        # logits ~ (N, depth, pad_to, pad_to) -> distribution summing to 1 over real cells.
+        if self.output_activation == 'voxel_softmax':
+            return self.masked_voxel_softmax(logits)
+        # sparse paths: gather real cells -> simplex projection -> scatter back, so
+        # padding cells stay exactly 0 (the 43->48 border + the ~8% intra-grid padding).
+        flat = logits.reshape(logits.shape[0], -1)              # (N, depth*P*P)
+        z = flat[:, self.real_idx]                              # (N, K)
+        if self.output_activation == 'sparsemax':
+            p = self._sparsemax(z)
+        else:  # 'relu_norm'
+            p = self._relu_norm(z)
+        out = torch.zeros_like(flat).index_copy(1, self.real_idx, p)
+        return out.reshape_as(logits).float()
+
     def forward(self, x, cond=None):
         # x ~ (N, ch_in, h, w); cond ~ (N, 1)
         if self.cond_dim > 0:
@@ -116,7 +176,7 @@ class Decoder(pl.LightningModule):
         # never perturbs the (already-trained) energy reconstruction.
         hit_logits = self.hit_head(feat.detach())               # (N, depth, pad_to, pad_to)
 
-        pix = self.masked_voxel_softmax(energy_logits)          # sums to 1 over real cells
+        pix = self.normalize_output(energy_logits)              # sums to 1 over real cells
         o = self.out_size
         pix = pix[..., :o, :o]                                  # crop pad_to -> 43
         hit_logits = hit_logits[..., :o, :o]                    # crop; downstream masks to real cells

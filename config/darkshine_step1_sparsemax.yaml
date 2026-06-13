@@ -1,0 +1,21 @@
+# Output-parameterisation experiment (sparsemax) -- targets the hits/occupancy
+# ~1.8x over-count left by the dense softmax. The decoder energy head now emits
+# EXACT zeros (Euclidean simplex projection) so it can match the genuinely-sparse
+# truth occupancy, instead of the soft non-zero halo that softmax cannot avoid.
+#
+# Stack on the baseline (override-only; everything else stays identical):
+#   PY=/Users/zhoubaihong/miniconda3/envs/caloVQ/bin/python
+#   $PY main.py --base config/darkshine_step1.yaml --base config/darkshine_step1_sparsemax.yaml \
+#       -t True -l logs -n dss1_sparsemax --max_epochs 30
+#
+# Occupancy now comes from the output parameterisation itself, so the auxiliary
+# hit/no-hit head + eval gate are turned off here to measure the raw effect.
+model:
+  params:
+    hit_gate: false              # sparse energy head already emits zeros; don't double-gate
+    decoder_config:
+      params:
+        output_activation: sparsemax
+    loss_config:
+      params:
+        hit_weight: 0.0          # occupancy now from the output param, not the BCE hit head

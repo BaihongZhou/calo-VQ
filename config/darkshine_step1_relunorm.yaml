@@ -1,0 +1,18 @@
+# Output-parameterisation experiment (relu_norm) -- the simplest sparse output:
+# relu(logits) renormalised to sum 1 over real cells, emitting exact zeros where
+# logits <= 0. Same goal as the sparsemax variant (fix the hits/occupancy ~1.8x
+# over-count) with a different sparse transform; compare the two against baseline.
+#
+# Stack on the baseline (override-only; everything else stays identical):
+#   PY=/Users/zhoubaihong/miniconda3/envs/caloVQ/bin/python
+#   $PY main.py --base config/darkshine_step1.yaml --base config/darkshine_step1_relunorm.yaml \
+#       -t True -l logs -n dss1_relunorm --max_epochs 30
+model:
+  params:
+    hit_gate: false              # sparse energy head already emits zeros; don't double-gate
+    decoder_config:
+      params:
+        output_activation: relu_norm
+    loss_config:
+      params:
+        hit_weight: 0.0          # occupancy now from the output param, not the BCE hit head
