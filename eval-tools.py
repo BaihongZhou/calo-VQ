@@ -34,10 +34,14 @@ from calo_ldm.metrics import ShowerMetrics
 torch.set_grad_enabled(False)
 
 
-def load_showers(path, n=None, key_e="energy", key_c="condition"):
+def load_showers(path, n=None, key_e="energy", key_c="condition", condition_scale=1e-3):
+    # condition is stored in keV (4e6 = 4 GeV); convert to MeV so it matches the
+    # per-cell deposited energy and R = E_tot/E_inc is physical (~0.97). Both the
+    # reference export.h5 and gen-tools output use the keV schema, so this is applied
+    # uniformly. (Mirrors CaloDarkSHINE's condition_scale.)
     with h5py.File(path, "r") as f:
         E = torch.from_numpy(f[key_e][:n]).float()       # (N, H, W, 11) channels-last
-        C = torch.from_numpy(f[key_c][:n]).float()       # (N, 1)
+        C = torch.from_numpy(f[key_c][:n]).float() * condition_scale   # (N, 1) keV -> MeV
     E = E.permute(0, 3, 1, 2).contiguous()               # (N, 11, H, W)
     if C.dim() == 1:
         C = C.unsqueeze(-1)

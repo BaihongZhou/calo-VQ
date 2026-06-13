@@ -67,15 +67,18 @@ def generate(model, args):
         incident.append(batch["E_inc"].cpu())
         n_done += bs
         print(f"  generated {n_done}/{args.nevts}")
+    # export.h5 stores `condition` in keV (4e6 = 4 GeV); E_inc here is MeV
+    # (CaloDarkSHINE divides by 1000 on load). Write keV back so the output is a
+    # drop-in match for the data schema (CaloDarkSHINE re-converts to MeV on reload).
     return {
-        "condition": torch.cat(incident, 0),                # (N,1)
+        "condition": torch.cat(incident, 0) * 1000.0,       # (N,1) MeV -> keV
         "energy": torch.cat(showers, 0),                    # (N,43,43,11) or (N,21,21,11)
     }
 
 
 def sanity_check(data):
     E = data["energy"]
-    C = data["condition"]
+    C = data["condition"] * 1e-3                            # keV -> MeV for display
     Etot = E.flatten(1).sum(1)
     print(f"--> events {E.shape[0]}, energy shape {tuple(E.shape)}, condition shape {tuple(C.shape)}")
     print(f"--> E_inc [{C.min():.1f}, {C.max():.1f}] MeV")

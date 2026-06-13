@@ -3,5 +3,6 @@ __pycache__/
 */__pycache__/
 *_data/
 logs/
+diagnostics/
 .idea/
 *.h5

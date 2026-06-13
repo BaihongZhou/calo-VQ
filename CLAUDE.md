@@ -43,7 +43,7 @@ The fixed geometry mask `DarkSHINE_data/geom_mask.npy` is required (see below); 
 
 `DarkSHINE_data/export.h5` (10000 events, currently a single 4 GeV energy point). Three keys:
 
-- `condition` (N, 1): incident particle energy [MeV] — the **stage-2 conditioning** (same role as ATLAS incident energy).
+- `condition` (N, 1): incident particle energy stored in **keV** (4e6 = 4 GeV) — the **stage-2 conditioning** (same role as ATLAS incident energy). `CaloDarkSHINE` converts it to **MeV** (`condition_scale=1e-3`) so it matches `energy`'s units; do not use the raw keV value.
 - `energy` (N, 43, 43, 11): per-cell **deposited** energy Eᵢ (the model input). Stored **channels-last**: `(x=43, y=43, depth=11)`.
 - `label` (N, 43, 43, 11) int {0,1,2,4}: a **per-event hit flag**. `label>0` ⟹ `energy>0` (every flagged cell has energy), but **not** the converse: 416 cells across 9 events have `energy>0` yet `label==0` (energies up to ~36 MeV — not sub-threshold noise), so `label>0` is a *strict subset* of `energy>0`, not an equivalence. It is *not* a fixed crystal mask and is **not used directly** by the model. Both `label` and `energy` are exactly 0 everywhere outside the geometry mask (verified over all 10000 events).
 
@@ -68,7 +68,7 @@ Data is channels-last `(N, 43, 43, 11)`; PyTorch conv2d needs `(N, C, H, W)`. Th
 Pipeline: encode → quantize → autoregress → decode, split across two `LightningModule`s.
 
 - **`calo_ldm/models/vqvae.py` (`VQModel`)** — Step-1. `Encoder` → `VectorQuantizer` (codebook of `n_embed`) → `Decoder`, trained with `CombinedLoss` (masked recon + codebook/commitment + shower energy-centre/width + adversarial `Discriminator`). The decoder output is a **masked voxel-softmax** that sums to **R** per shower (energy ratio = E_dep/E_inc); the VQ-VAE models the *shape*, R carries the *scale*. Uses PL2 manual optimization for the two optimizers (AE + discriminator).
-- **`calo_ldm/models/gpt.py` (`CondGPT`)** — Step-2. Loads and **freezes** a `VQModel`, encodes showers to a `sequence_shape=(6,6)` code grid, and trains a GPT to autoregressively predict codes conditioned on incident energy. With `predict_R: true`, R is quantized to `R_bits` and prepended to the token sequence. **DarkSHINE R ≈ 1e-3** (4 GeV in, ~3.9 GeV deposited), so set `R_max ≈ 0.0011` (not the paper's ~1.3) for usable resolution. `sample_fullchain(batch)` is the generation entry point.
+- **`calo_ldm/models/gpt.py` (`CondGPT`)** — Step-2. Loads and **freezes** a `VQModel`, encodes showers to a `sequence_shape=(6,6)` code grid, and trains a GPT to autoregressively predict codes conditioned on incident energy. With `predict_R: true`, R is quantized to `R_bits` and prepended to the token sequence. **DarkSHINE R ≈ 0.97** (4 GeV in, ~3.9 GeV deposited, units matched — see the unit fix below), so `R_max ≈ 1.1` (paper-like). NOTE: earlier configs used `R_max ≈ 0.0011` because `condition` was read in keV while `energy` is in MeV (a 1000× bug, now fixed in `CaloDarkSHINE`). `sample_fullchain(batch)` is the generation entry point.
 
 ### Geometry mapping (depth → channel, (x,y) → image)
 
@@ -188,7 +188,24 @@ Conservative fix now in the configs/code:
 
 Use a staged gate before spending a full training budget: train optimized Step 1 for 30 epochs on two A800 GPUs, require at least 32 validation-batch unique codes and perplexity at least 16 plus materially improved detector-shape observables, then continue Step 1/Step 2 to 200 epochs only if the gate passes.
 
-Gate result: `logs/2026-06-11T06-11-08_dss1_u_l1_gate` completed 30 epochs and failed the gate. `last.ckpt` reached `val/rec_loss=1.90604`, but `/tmp/calo-vq-gate-diagnostics.json` shows only 2 validation-batch unique codes, perplexity 1.97, `E_max_frac` ratio 0.0024, `hits` ratio 23.7, and width ratios `z/x/y = 2.27/7.77/7.98`. Stop before Step 2/full training for this pass. The next pass should address sparse shower occupancy and codebook collapse directly, for example with a hit/no-hit head or weighted sparse reconstruction, explicit codebook usage pressure/reinitialization, and possibly a less compressed latent grid.
+Gate result: `logs/2026-06-11T06-11-08_dss1_u_l1_gate` completed 30 epochs and failed the gate. `last.ckpt` reached `val/rec_loss=1.90604`, but only 2 validation-batch unique codes, perplexity 1.97, `E_max_frac` ratio 0.0024, `hits` ratio 23.7, and width ratios `z/x/y = 2.27/7.77/7.98`.
+
+### 2026-06-11 pass 2 — ROOT-CAUSED and fixed (see `Agent_md/optimization_plan.md`, `diagnostics/ROOT_CAUSE_REPORT.md`)
+
+The gate's "U + L1" pass failed for two **independent** reasons, both in Stage 1, neither of which the conservative pass addressed:
+
+1. **Unit bug.** `condition` is keV (4e6 = 4 GeV), `energy` is MeV (~3900 = 3.9 GeV) — a 1000× mismatch. So `R ≈ 9.7e-4` was an *artifact*, not physics (true `R ≈ 0.97`). Through the fixed `LogScale(0,3000,7)` this starved the encoder (real-cell input mean 2e-5 vs the ~0.2–0.7 the convs need). Switching the loss to U-space did nothing because the encoder *input* scale was never fixed.
+2. **VQ codebook/posterior collapse.** The plain gradient VQ cold-starts into collapse (1–2 live codes); DarkSHINE's single energy point makes it severe.
+
+**Fixes applied:**
+- Unit fix at the data boundary — `data.py::CaloDarkSHINE(condition_scale=1e-3)` (keV→MeV); `vqvae.preprocess_cond` offset −6.0→−3.6; `config/darkshine_step2.yaml` `R_max 0.0011→1.1`. `LogScale(0,3000,7)` unchanged (now correct).
+- EMA codebook in `calo_ldm/layers/vectorquantizer.py` — EMA updates + data-dependent init + dead-code reinit (replaces the collapse-prone gradient codebook; training-only; `ema`/`ema_decay`/`reinit_threshold`/`reinit_every` knobs). Diagnostics-only dead-code-reinit on the plain gradient VQ was tried first and diverged to NaN — EMA is required.
+
+**Validation.** Step 1 (`logs/2026-06-11T22-14-06_dss1_fix3`, best-val ckpt): **988 codes, perplexity 144, rec L1 0.289** (uniform=1.93); detector-shape ratios E_tot 1.000 / E_max_frac 0.992 / z_cog 0.978 / x_sigma 0.911 / hits 1.78. Step 2 (`logs/2026-06-12T14-24-34_dss2_fix3`, 50 ep) → generation @ 4 GeV (2.4 ms/shower): E_tot ratio 1.000, R 0.975 (physical), z_cog 0.989 / z_sigma 0.980, hits 1.81. From "never learned" to a working fast-sim; remaining blemish is hits/occupancy ~1.8× (sparsity is the next target). Full numbers in `Agent_md/optimization_plan.md`; reproducer `diagnostics/diagnose_stage1.py`.
+
+**Two operational gotchas:** (1) always load data through `CaloDarkSHINE` (or apply `condition_scale`) when evaluating — reading `condition` raw feeds keV-scale inputs to a MeV-trained model and *fakes* an encoder collapse (this bit `diagnose_stage1.py` mid-investigation). (2) `main.py --max_epochs` is an argparse flag defaulting to 200 that **overrides** any `lightning.trainer.max_epochs` dotlist — use the flag (`--max_epochs 50`), not the dotlist. The GAN (`disc_start=10000`≈ep92, `disc_weight=0.2`) diverged to NaN at epoch 161 in the 200-epoch run; for >90-epoch runs raise `disc_start`/lower `disc_weight` or grad-clip.
+
+**Hit/no-hit head (pass 3, occupancy fix).** The decoder has a second 1×1 head (`hit_head`, on *detached* features) trained with class-imbalance BCE on `E_cell>0.025 MeV`; at eval/generation a hard gate `sigmoid(hit_logits)>hit_gate_threshold` (default 0.4) masks the energy softmax and renormalises (`VQModel._apply_hit_gate`, preserves E_tot/R). It cuts generation `hits` 1.81→1.34 (thr 0.4) or →1.12 (thr 0.5) at a modest width cost (gating trims the outer halo, which also narrows the shower — a tunable tradeoff). Train it via `freeze_except_hit_head=True` (load a trained energy ckpt, freeze everything incl. the EMA codebook, train only the head, `disc_weight=0`) — a full fine-tune NaN's (fresh-Adam overshoot on converged weights). Artifacts: `logs/2026-06-12T23-09-55_dss1_hithead` (energy=fix3 + head; codebook identical so the GPT is reusable), `logs/2026-06-12T23-54-09_dss2_hit`. A cleaner occupancy/width decoupling needs a sparse output parameterisation (sparsemax / ReLU-normalised) — future work.
 
 
 ## Notes

@@ -42,6 +42,8 @@ model:
     metric_hit_threshold: 0.1  # [MeV] cell energy above which a cell counts as a hit
     downsample_mode: sum       # 43x43 -> 21x21 crystal aggregation: sum | min
     convert_to_detector_shape: false  # true -> postprocess output is (N,11,21,21) (ONNX/export)
+    hit_gate: true             # apply the decoder hit/no-hit gate at eval/generation
+    hit_gate_threshold: 0.4    # sigmoid(hit_logits)>thr kept; calibrated for hits~1 (see optimization_plan)
     embed_dim: 64
     n_embed: 1024
     cond_dim: 1
@@ -77,6 +79,8 @@ model:
         pixel_weight: 1
         ec_weight: 0.0001
         width_weight: 0.0001
+        hit_weight: 1.0          # masked BCE occupancy head (sparse-shower / hits fix)
+        hit_threshold: 0.025     # [MeV] per 43x43 cell = crystal 0.1 MeV / 4
         disc_start: 10000      # let shape reconstruction/codebook warm up before GAN pressure
         disc_weight: 0.2
         codebook_weight: 1.0

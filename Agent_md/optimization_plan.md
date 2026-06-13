@@ -1,3 +1,131 @@
+# 2026-06-11 (pass 2) — root-caused the "model never learned" failure
+
+Full evidence: `diagnostics/ROOT_CAUSE_REPORT.md`; reproducer: `diagnostics/diagnose_stage1.py`.
+
+**Two independent root causes, both in Stage 1:**
+
+1. **Unit mismatch (keV vs MeV).** `condition` is stored in keV (4e6 = 4 GeV); `energy`
+   is in MeV (Σ ≈ 3900 = 3.9 GeV). The code computed `R = E/E_inc ≈ 9.7e-4` instead of
+   the physical ~0.97. Through the fixed encoder front-end `LogScale(0,3000,7)` (tuned
+   for the paper's R≈1.3) this mapped real-cell inputs to a mean of **2e-5** (paper
+   regime ~0.2–0.7) → the encoder was **starved**. The earlier "U-space loss" patch did
+   not help because it fixed the *loss* scale, not the *encoder-input* scale.
+2. **VQ codebook / posterior collapse.** Even with healthy inputs the plain gradient VQ
+   cold-starts into collapse (codebook init `±1/n_e` ≪ encoder outputs → 1 code nearest
+   to everything → commitment loss drags the encoder onto it). DarkSHINE's single energy
+   point (near-identical showers) makes this severe. Result: 1–2 live codes, decoder
+   emits the over-broad mean shower.
+
+**Fixes (minimal, traceable):**
+- Unit fix at the data boundary: `data.py::CaloDarkSHINE(condition_scale=1e-3)` (keV→MeV);
+  `vqvae.preprocess_cond` offset −6.0→−3.6 (recentre `log_E_inc`); `step2` `R_max 0.0011→1.1`.
+  `LogScale(0,3000,7)` is left unchanged — now correct (real-cell mean 0.076 / p99 0.65).
+- EMA codebook in `vectorquantizer.py`: EMA updates + data-dependent init + dead-code
+  reinit (replaces the collapse-prone gradient codebook; no NaN). Knobs: `ema`,
+  `ema_decay`, `reinit_threshold`, `reinit_every`.
+
+**Validation (Step 1, 50 epochs, CPU, load_partial=1000/file, `--scale_lr True`):**
+- Run: `logs/<ts>_dss1_fix3`. Diagnostic at **epoch 18** (corrected diagnostic, routed
+  through the real dataloader):
+
+  | metric | failed baseline | fix3 @ep18 |
+  |---|---|---|
+  | unique codes (/1024) | 2 | 796 |
+  | perplexity | 1.97 | 74.6 |
+  | rec L1 (uniform=1.93) | ~1.91 | 0.42 |
+  | E_max_frac ratio | 0.0024 | 0.97 |
+  | hits ratio | 23.6 | 0.79 |
+  | z_cog / z_sigma ratio | 2.2 / 2.27 | 0.90 / 0.90 |
+  | x_sigma / y_sigma ratio | 7.8 / 8.0 | 0.74 / 0.74 |
+
+  Final Step-1 artifact = `logs/2026-06-11T22-14-06_dss1_fix3/checkpoints/last.ckpt`
+  (= best-val `epoch=000160.ckpt`; the run's `max_epochs` was clobbered to 200 — see
+  the `--max_epochs` gotcha below — and the GAN diverged at epoch 161, but the saved
+  best-val model is healthy). At 1000 val events: **988 codes, perplexity 144, rec L1
+  0.289**; ratios E_tot 1.000 / E_max_frac 0.992 / z_cog 0.978 / z_sigma 0.973 /
+  x_sigma 0.911 / y_sigma 0.927 / hits 1.78.
+
+**Step 2 (GPT prior) + generation** — `logs/2026-06-12T14-24-34_dss2_fix3` (50 ep,
+`R_max=1.1`, R-loopback error 1.5e-5). `val/loss` 2.289 → 2.251 (uniform = log 1024 =
+6.93). Generated 2000 showers @ 4 GeV (2.4 ms/shower) and compared to truth at 21×21
+(`eval-tools.py`):
+
+  | gen-vs-truth | failed baseline (old eval) | fix3 |
+  |---|---|---|
+  | E_tot ratio | 0.0094 | 1.000 |
+  | R (physical) | garbage (units bug) | 0.975 vs 0.975, ratio 1.00 |
+  | z_cog / z_sigma ratio | 2.20 / 1.89 | 0.989 / 0.980 |
+  | hits ratio | 0.28 | 1.81 |
+
+**Net:** from "model never learned" (E_max_frac 0.24% of truth, widths 7.8×, 2 live
+codes, generation 1% of the energy) to a working fast-sim that reproduces total energy,
+R, and the longitudinal/lateral shower shape. Remaining blemish: **hits/occupancy ~1.8×**
+(energy spread into ~1.8× as many low-energy cells near the 0.1 MeV threshold) — next
+target, e.g. a hit/no-hit head or sparsity-weighted reconstruction.
+
+**Unit bookkeeping is now consistent end-to-end:** `condition` is keV in the h5;
+`CaloDarkSHINE`, `gen-tools.py` (writes keV back), and `eval-tools.py` (`condition_scale`)
+all convert to MeV, so R is physical (~0.97) everywhere.
+
+## 2026-06-12 (pass 3) — hit/no-hit head for the occupancy (hits) blemish
+
+The `hits` ratio ~1.8× (energy spread into too many low-energy cells) is structural:
+the masked voxel-softmax can't emit exact zeros, so it leaves a soft outer halo.
+
+**Added a hit/no-hit head** (`decoder.py` `hit_head`, a parallel 1×1 conv on
+*detached* final features): trained with a masked, class-imbalance-weighted BCE on
+`E_cell > 0.025 MeV` (`combined.py`, `hit_weight`); at eval/generation a hard gate
+`sigmoid(hit_logits) > hit_gate_threshold` masks the energy softmax and renormalises
+(`VQModel._apply_hit_gate`), preserving E_tot/R exactly. Generation needs no GPT change
+(the gate decodes deterministically from the codes).
+
+**Training notes / dead ends:**
+- Full fine-tune of the converged fix3 model with the new head **NaN'd at step ~13**
+  (fresh-Adam overshoot on converged weights). A fresh 50-epoch train was stable but
+  under-occupied (hits 0.75 — occupancy is training-duration-dependent: early=peaked/few,
+  late=broad/many). The robust path is `freeze_except_hit_head=True` (VQModel): load the
+  validated fix3 energy model, freeze everything (incl. the EMA codebook), train ONLY the
+  hit head (disc off). rec_loss stays 0.29 (energy untouched); no NaN.
+- Stage-1 artifact: `logs/2026-06-12T23-09-55_dss1_hithead` (= fix3 energy + hit head;
+  codebook identical to fix3, so the existing GPT is compatible). Stage 2 retrained:
+  `logs/2026-06-12T23-54-09_dss2_hit`.
+
+**The gate couples hits and width** (it trims the outer tail, which also narrows the
+shower), so it is a tunable tradeoff via `hit_gate_threshold` (default 0.4). Generation
+(2000 showers vs truth, ratios→1):
+
+  | metric | no hit head | hit+gate (thr 0.4) | thr 0.5 |
+  |---|---|---|---|
+  | hits | 1.81 | **1.34** | 1.12 |
+  | E_max_frac | 0.99 | 1.10 | 1.18 |
+  | x/y_sigma | 0.92 / 0.96 | 0.82 / 0.83 | 0.78 / 0.78 |
+  | z_cog / z_sigma | 0.99 / 0.98 | 0.96 / 0.93 | — |
+  | E_tot / R | 1.00 / 1.00 | 1.00 / 1.00 | 1.00 |
+
+hits improves 1.81→1.34 (thr 0.4) or →1.12 (thr 0.5) at a modest width cost. A cleaner
+fix (decouple occupancy from width) needs a genuinely sparse energy parameterisation
+(e.g. sparsemax / ReLU-normalised output, or a learned per-cell threshold) — the next
+redesign if tighter occupancy+width is required.
+
+**Gotcha for the next agent:** evaluate models THROUGH `CaloDarkSHINE` (or apply
+`condition_scale`), never by reading `condition` raw from the h5 — the raw value is keV
+and will fake an encoder collapse on a correctly-trained model.
+
+**Two operational gotchas found during this pass:**
+- `main.py --max_epochs` is an argparse flag that **defaults to 200 and unconditionally
+  overwrites** `lightning.trainer.max_epochs` (main.py:143). A dotlist
+  `lightning.trainer.max_epochs=50` is silently clobbered — use the **flag** `--max_epochs 50`.
+- **GAN late-divergence.** With `disc_start=10000` steps (~epoch 92 at load_partial=1000)
+  and `disc_weight=0.2`, the `dss1_fix3` run was stable for ~70 more epochs then went to
+  **NaN at epoch 161** (perplexity collapsed back to 1, rec_loss=nan). The best-val
+  checkpoint (`last.ckpt` == `epoch=000160.ckpt`: 988 codes, rec L1 0.289, no NaN) was
+  saved before the blow-up and is the Stage-1 artifact used for Stage 2. For runs that
+  will exceed ~90 epochs, raise `disc_start` / lower `disc_weight` (or keep the GAN off —
+  reconstruction is already excellent without it), and consider grad-clipping. At ≤50
+  epochs the discriminator never activates, so it is a non-issue for the gate run.
+
+---
+
 # 2026-06-11 conservative DarkSHINE optimization pass
 
 ## Diagnosis

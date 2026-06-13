@@ -52,6 +52,9 @@ class VQModel(pl.LightningModule):
                  metric_hit_threshold=0.1, # [MeV] cell energy above which a cell is a "hit"
                  downsample_mode='sum',    # 43x43 -> 21x21 crystal aggregation: 'sum' or 'min'
                  convert_to_detector_shape=False,  # if True, postprocess output is (N,11,21,21)
+                 hit_gate=True,            # apply the decoder hit/no-hit gate at eval/generation
+                 hit_gate_threshold=0.5,   # sigmoid(hit_logits) > thr -> cell kept
+                 freeze_except_hit_head=False,  # train ONLY the decoder hit head (energy model frozen)
                  **unused):                # absorb any leftover config keys
         super().__init__()
         # PL2: two optimizers (AE + discriminator) -> manual optimization.
@@ -69,6 +72,9 @@ class VQModel(pl.LightningModule):
         self.metric_hit_threshold = metric_hit_threshold
         self.downsample_mode = downsample_mode
         self.convert_to_detector_shape = convert_to_detector_shape
+        self.hit_gate = hit_gate
+        self.hit_gate_threshold = hit_gate_threshold
+        self.freeze_except_hit_head = freeze_except_hit_head
         self._val_metrics = None
 
         # fixed geometry mask (depth, x, y) = (11, 43, 43); same for every shower.
@@ -109,6 +115,20 @@ class VQModel(pl.LightningModule):
 
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+        if self.freeze_except_hit_head:
+            # Train ONLY the decoder hit head on top of a frozen, already-trained
+            # energy model (loaded from ckpt_path). Freezing avoids the fresh-Adam
+            # overshoot that NaN's a full fine-tune, and keeps the codebook fixed.
+            # The discriminator is left trainable (its manual_backward must run); use
+            # disc_weight=0 so it never touches the generator.
+            for module in (self.encoder, self.decoder, self.quantize,
+                           self.quant_conv, self.post_quant_conv):
+                for p in module.parameters():
+                    p.requires_grad = False
+            for p in self.decoder.hit_head.parameters():
+                p.requires_grad = True
+            self.quantize.ema = False          # do not move the (frozen) codebook
 
     # ------------------------------------------------------------------ EMA
     @contextmanager
@@ -167,9 +187,10 @@ class VQModel(pl.LightningModule):
 
     # -------------------------------------------------------------- (pre/post)process
     def preprocess_cond(self, batch):
-        # E_inc ~ (N,1). Current DarkSHINE data is a single energy point (4 GeV);
-        # the conditioning is kept general (log10 energy, centred ~0).
-        batch['log_E_inc'] = torch.log10(batch['E_inc']) - 6.0
+        # E_inc ~ (N,1) in MeV (the dataloader converts condition keV->MeV). Current
+        # DarkSHINE data is a single energy point (4 GeV = 4000 MeV); the conditioning
+        # is kept general (log10 energy, centred ~0): log10(4000)-3.6 ~ 0.
+        batch['log_E_inc'] = torch.log10(batch['E_inc']) - 3.6
         batch['cond'] = batch['log_E_inc']
         return batch
 
@@ -195,6 +216,16 @@ class VQModel(pl.LightningModule):
         batch['pixels_E'] = batch['pixels_E_orig']
         return batch
 
+    def _apply_hit_gate(self, U, hit_logits):
+        # Hard hit gate: keep only cells with sigmoid(hit_logits) > threshold, then
+        # renormalise the survivors back to sum-1 over real cells (preserves R/E_tot).
+        # Falls back to the ungated U for any shower the gate would empty entirely.
+        mask = self.mask[None].to(U.dtype)                      # (1, 11, 43, 43)
+        gate = (torch.sigmoid(hit_logits) > self.hit_gate_threshold).to(U.dtype) * mask
+        Ug = U * gate
+        s = Ug.sum(dim=(-1, -2, -3), keepdim=True)
+        return torch.where(s > 1e-8, Ug / s.clamp(min=1e-8), U)
+
     def forward(self, batch, test_code=False):
         enc = self.encode(batch['pixels_R'], batch['cond'])
         if test_code:
@@ -208,7 +239,13 @@ class VQModel(pl.LightningModule):
         Einc = batch['E_inc']
         if Einc.dim() < 2:
             Einc = Einc.unsqueeze(-1)
-        pred['pixels_R_pred'] = pred['pixels_U_pred'] * R
+        # pixels_U_pred stays the ungated softmax (the reconstruction/disc loss compare
+        # in U space). The hit gate is applied only to the energy outputs and only at
+        # eval/generation, so training of the energy head is unchanged.
+        U_energy = pred['pixels_U_pred']
+        if self.hit_gate and (not self.training) and 'pixels_hit_logits' in pred:
+            U_energy = self._apply_hit_gate(U_energy, pred['pixels_hit_logits'])
+        pred['pixels_R_pred'] = U_energy * R
         pred['pixels_E_pred'] = pred['pixels_R_pred'] * Einc[..., None, None]
         return pred
 
@@ -218,8 +255,11 @@ class VQModel(pl.LightningModule):
         Einc = batch['E_inc']
         if Einc.dim() < 2:
             Einc = Einc.unsqueeze(-1)
-        post = {'pixels_U_pred': pred['pixels_U_pred']}
-        post['pixels_R_pred'] = pred['pixels_U_pred'] * R
+        U = pred['pixels_U_pred']
+        if self.hit_gate and 'pixels_hit_logits' in pred:
+            U = self._apply_hit_gate(U, pred['pixels_hit_logits'])
+        post = {'pixels_U_pred': U}
+        post['pixels_R_pred'] = U * R
         post['pixels_E_pred'] = post['pixels_R_pred'] * Einc[..., None, None]
         if renorm:
             post = self.renorm_R(post)
@@ -321,12 +361,15 @@ class VQModel(pl.LightningModule):
 
     def configure_optimizers(self):
         lr = self.learning_rate
-        opt_ae = torch.optim.Adam(list(self.encoder.parameters()) +
-                                  list(self.decoder.parameters()) +
-                                  list(self.quantize.parameters()) +
-                                  list(self.quant_conv.parameters()) +
-                                  list(self.post_quant_conv.parameters()),
-                                  lr=self.lr_g_factor * lr, betas=(0.5, 0.9))
+        if self.freeze_except_hit_head:
+            ae_params = list(self.decoder.hit_head.parameters())
+        else:
+            ae_params = (list(self.encoder.parameters()) +
+                         list(self.decoder.parameters()) +
+                         list(self.quantize.parameters()) +
+                         list(self.quant_conv.parameters()) +
+                         list(self.post_quant_conv.parameters()))
+        opt_ae = torch.optim.Adam(ae_params, lr=self.lr_g_factor * lr, betas=(0.5, 0.9))
         opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(), lr=lr, betas=(0.5, 0.9))
 
         if self.scheduler_config is not None:

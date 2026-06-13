@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 import numpy as np
 import einops as ein
@@ -26,7 +27,9 @@ class VectorQuantizer(nn.Module):
     # backwards compatibility we use the buggy version by default, but you can
     # specify legacy=False to fix it.
     def __init__(self, n_e, e_dim, beta, remap=None, unknown_index="random",
-                 sane_index_shape=True, legacy=True, pixels_dim=3):
+                 sane_index_shape=True, legacy=True, pixels_dim=3,
+                 ema=True, ema_decay=0.99, ema_eps=1e-5,
+                 reinit_dead=True, reinit_threshold=1.0, reinit_every=20):
         super().__init__()
         self.n_e = n_e
         self.e_dim = e_dim
@@ -37,6 +40,29 @@ class VectorQuantizer(nn.Module):
 
         self.embedding = nn.Embedding(self.n_e, self.e_dim)
         self.embedding.weight.data.uniform_(-1.0 / self.n_e, 1.0 / self.n_e)
+
+        # --- codebook-collapse prevention (see diagnostics/ROOT_CAUSE_REPORT.md) ---
+        # DarkSHINE is a single energy point -> nearly identical showers. The plain
+        # gradient VQ cold-starts into posterior collapse: the random codebook
+        # (scale ~1/n_e) is so much smaller than the encoder outputs that the same
+        # single code is nearest to every shower, and the commitment loss then drags
+        # all encoder outputs onto it -> 1 live code, decoder outputs the mean shower.
+        # Fix: (1) EMA codebook updates (van den Oord) instead of a codebook gradient
+        # term -- removes the commitment runaway / NaN; (2) data-dependent init of the
+        # codebook from the first training batch's encoder outputs (codes span the
+        # data from step 0); (3) dead-code reinit (random restart) of codes whose EMA
+        # cluster size falls below threshold. All active in training only; a no-op at
+        # eval and in the frozen stage-2 VQ model.
+        self.ema = ema
+        self.ema_decay = ema_decay
+        self.ema_eps = ema_eps
+        self.reinit_dead = reinit_dead
+        self.reinit_threshold = reinit_threshold
+        self.reinit_every = reinit_every
+        self.register_buffer("cluster_size", torch.zeros(self.n_e))
+        self.register_buffer("embed_avg", self.embedding.weight.data.clone())
+        self.register_buffer("ema_initted", torch.zeros((), dtype=torch.long))
+        self.register_buffer("reinit_steps", torch.zeros((), dtype=torch.long))
 
         self.remap = remap
         if self.remap is not None:
@@ -83,6 +109,42 @@ class VectorQuantizer(nn.Module):
         back=torch.gather(used[None,:][inds.shape[0]*[0],:], 1, inds)
         return back.reshape(ishape)
 
+    @torch.no_grad()
+    def _ema_init(self, z_flattened):
+        # seed every code with a random encoder output from the first batch
+        # (sampling with replacement is fine; reinit will diversify duplicates).
+        m = z_flattened.shape[0]
+        idx = torch.randint(m, (self.n_e,), device=z_flattened.device)
+        seed = z_flattened[idx].detach()
+        self.embedding.weight.data.copy_(seed)
+        self.embed_avg.copy_(seed)
+        self.cluster_size.fill_(1.0)
+        self.ema_initted.fill_(1)
+
+    @torch.no_grad()
+    def _ema_update(self, z_flattened, indices):
+        onehot = F.one_hot(indices, self.n_e).type(z_flattened.dtype)   # (M, n_e)
+        n_i = onehot.sum(0)                                             # (n_e,)
+        embed_sum = onehot.t() @ z_flattened                           # (n_e, e_dim)
+        self.cluster_size.mul_(self.ema_decay).add_(n_i, alpha=1.0 - self.ema_decay)
+        self.embed_avg.mul_(self.ema_decay).add_(embed_sum, alpha=1.0 - self.ema_decay)
+        # Laplace-smoothed normalisation -> codebook = EMA mean of assigned encodings
+        n = self.cluster_size.sum()
+        cs = (self.cluster_size + self.ema_eps) / (n + self.n_e * self.ema_eps) * n
+        self.embedding.weight.data.copy_(self.embed_avg / cs.unsqueeze(1))
+
+        # dead-code reinit (random restart): reseed codes that fell out of use.
+        self.reinit_steps += 1
+        if self.reinit_dead and int(self.reinit_steps % self.reinit_every) == 0:
+            dead = self.cluster_size < self.reinit_threshold
+            n_dead = int(dead.sum())
+            if n_dead > 0 and z_flattened.shape[0] > 0:
+                rand = torch.randint(z_flattened.shape[0], (n_dead,), device=z_flattened.device)
+                sampled = z_flattened[rand].detach()
+                self.embedding.weight.data[dead] = sampled
+                self.embed_avg[dead] = sampled
+                self.cluster_size[dead] = 1.0
+
     def forward(self, z, temp=None, rescale_logits=False, return_logits=False):
         assert temp is None or temp==1.0, "Only for interface compatible with Gumbel"
         assert rescale_logits==False, "Only for interface compatible with Gumbel"
@@ -98,6 +160,11 @@ class VectorQuantizer(nn.Module):
         assert z.shape[-1]==self.e_dim
         z_flattened = z.view(-1, self.e_dim) # (N,E)
 
+        # data-dependent codebook init from the first training batch's encoder
+        # outputs, so the codes span the data distribution from step 0.
+        if self.training and self.ema and int(self.ema_initted) == 0:
+            self._ema_init(z_flattened)
+
         # distances from z to embeddings e_j (z - e)^2 = z^2 + e^2 - 2 e * z
         d = torch.sum(z_flattened ** 2, dim=1, keepdim=True) + \
             torch.sum(self.embedding.weight**2, dim=1) - 2 * \
@@ -109,7 +176,11 @@ class VectorQuantizer(nn.Module):
         min_encodings = None
 
         # compute loss for embedding
-        if not self.legacy:
+        if self.ema:
+            # EMA codebook: only the commitment term drives the encoder; the codebook
+            # itself is updated by EMA below (no gradient term -> no commitment runaway).
+            loss = self.beta * torch.mean((z_q.detach() - z) ** 2)
+        elif not self.legacy:
             loss = self.beta * torch.mean((z_q.detach()-z)**2) + \
                    torch.mean((z_q - z.detach()) ** 2)
         else:
@@ -118,6 +189,12 @@ class VectorQuantizer(nn.Module):
 
         # preserve gradients
         z_q = z + (z_q - z).detach()
+
+        # --- EMA codebook update + dead-code reinit (training only) ---
+        # `min_encoding_indices` here is the raw argmin over the full codebook
+        # (before any remap), so the usage statistics cover all n_e codes.
+        if self.training and self.ema:
+            self._ema_update(z_flattened, min_encoding_indices)
 
         if self.pixels_dim == 3:
             # reshape back to match original input shape

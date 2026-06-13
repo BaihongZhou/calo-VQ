@@ -15,7 +15,8 @@ from calo_ldm.util import instantiate_from_config
 class CaloDarkSHINE(Dataset):
     """DarkSHINE ECAL dataset (export.h5).
 
-    Keys: `condition` (N,1) incident energy [MeV], `energy` (N,43,43,11) deposited
+    Keys: `condition` (N,1) incident energy stored in keV (converted to MeV here via
+    `condition_scale`), `energy` (N,43,43,11) deposited
     energy per cell, `label` (N,43,43,11) per-event hit flag (unused by the model;
     the geometry mask is a fixed, sample-independent buffer loaded separately).
 
@@ -27,7 +28,13 @@ class CaloDarkSHINE(Dataset):
     misalign the data with the mask.
     """
     def __init__(self, file_path=None, sample_list=None, load_partial=None,
-                 key_energy='energy', key_condition='condition'):
+                 key_energy='energy', key_condition='condition',
+                 condition_scale=1e-3):
+        # condition_scale: `condition` is stored in keV (4e6 = 4 GeV) while `energy`
+        # is in MeV (sum ~3900 = 3.9 GeV) -- a 1000x unit mismatch. Without this the
+        # ratio R = E_dep/E_inc came out ~1e-3 instead of the physical ~0.97, which
+        # starved the encoder's LogScale front-end (see diagnostics/ROOT_CAUSE_REPORT.md).
+        # Default 1e-3 converts condition keV->MeV so E_inc and energy share units.
         super().__init__()
         if sample_list is None:
             if file_path is None:
@@ -46,7 +53,8 @@ class CaloDarkSHINE(Dataset):
                 condition_chunks.append(torch.from_numpy(h5_file[key_condition][:load_partial]).float())
 
         E = torch.cat(energy_chunks)
-        self._e_inc = torch.cat(condition_chunks)
+        # keV -> MeV so incident energy matches the per-cell deposited energy units.
+        self._e_inc = torch.cat(condition_chunks) * condition_scale
         # channels-last (N, x, y, depth) -> channels-first (N, depth, x, y)
         self._data = E.permute(0, 3, 1, 2).contiguous()
         self.dataset_len = len(self._e_inc)

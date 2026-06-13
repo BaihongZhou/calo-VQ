@@ -77,8 +77,17 @@ class Decoder(pl.LightningModule):
             self.dec_layers.append(activation_class())
             self._adaptive_layer = conv
 
-        # 1x1 conv to the depth channel dim (logits)
+        # 1x1 conv to the depth channel dim (energy-shape logits). Kept as the last
+        # element of dec_layers so its checkpoint key is unchanged (the energy model
+        # loads cleanly when fine-tuning with the new hit head).
         self.dec_layers.append(nn.Conv2d(w_in, ch_out, kernel_size=(1, 1)))
+
+        # Hit/no-hit head (sparse-occupancy modelling): a parallel 1x1 conv on the
+        # same final features producing per-cell hit logits. Trained with a masked,
+        # class-imbalance-weighted BCE; at inference a hard gate sigmoid(logits)>thr
+        # masks the energy softmax so the over-broad soft tail is removed. See
+        # VQModel._apply_hit_gate / CombinedLoss (hit_weight).
+        self.hit_head = nn.Conv2d(w_in, ch_out, kernel_size=(1, 1))
 
     def get_adaptive_layer_weights(self):
         return self._adaptive_layer.weight
@@ -98,11 +107,18 @@ class Decoder(pl.LightningModule):
             xc = cond[:, None, None].expand((-1, -1, x.shape[-2], x.shape[-1]))
             x = torch.concat([x, xc], axis=-3)
 
-        pix = x
-        for layer in self.dec_layers:
-            pix = layer(pix)                                    # -> (N, depth, pad_to, pad_to) logits
+        feat = x
+        layers = list(self.dec_layers)
+        for layer in layers[:-1]:                               # body up to the last activation
+            feat = layer(feat)
+        energy_logits = layers[-1](feat)                        # (N, depth, pad_to, pad_to)
+        # detach the shared features: the hit head trains only its own 1x1 conv and
+        # never perturbs the (already-trained) energy reconstruction.
+        hit_logits = self.hit_head(feat.detach())               # (N, depth, pad_to, pad_to)
 
-        pix = self.masked_voxel_softmax(pix)                    # sums to 1 over real cells
-        pix = pix[..., :self.out_size, :self.out_size]          # crop pad_to -> 43
+        pix = self.masked_voxel_softmax(energy_logits)          # sums to 1 over real cells
+        o = self.out_size
+        pix = pix[..., :o, :o]                                  # crop pad_to -> 43
+        hit_logits = hit_logits[..., :o, :o]                    # crop; downstream masks to real cells
 
-        return {'pixels_U_pred': pix}
+        return {'pixels_U_pred': pix, 'pixels_hit_logits': hit_logits}

@@ -1,6 +1,7 @@
 import sys
 import torch
 from torch import nn
+import torch.nn.functional as F
 import pytorch_lightning as pl
 
 from calo_ldm.util import (
@@ -27,6 +28,7 @@ class CombinedLoss(pl.LightningModule):
                  n_embed=None,
                  pixel_power=2, pixel_weight=1,
                  ec_weight=0., width_weight=0.,
+                 hit_weight=0., hit_threshold=0.025, hit_pos_weight_max=50.,
                  disc_config=None,
                  cond_dim=0, log_scale_params=None,
                  reco_normalization='R', disc_normalization='U',
@@ -41,6 +43,12 @@ class CombinedLoss(pl.LightningModule):
         self.pixel_weight = pixel_weight
         self.ec_weight = ec_weight
         self.width_weight = width_weight
+        # hit/no-hit (occupancy) head: masked, class-imbalance-weighted BCE on
+        # (E_cell > hit_threshold). hit_threshold is per-43x43-cell (= crystal 0.1 MeV
+        # / 4, since a hit crystal splits equally over its 2x2 block in truth).
+        self.hit_weight = hit_weight
+        self.hit_threshold = hit_threshold
+        self.hit_pos_weight_max = hit_pos_weight_max
         self.reco_normalization = reco_normalization
         self.disc_normalization = disc_normalization
         self.adaptive_max = adaptive_max
@@ -113,11 +121,29 @@ class CombinedLoss(pl.LightningModule):
         ec_loss = 0.5 * ((ecx_t - ecx_p) ** 2 + (ecy_t - ecy_p) ** 2).mean()
         width_loss = 0.5 * ((wx_t - wx_p) ** 2 + (wy_t - wy_p) ** 2).mean()
 
+        # ---- hit/no-hit (occupancy) head ----
+        hit_loss = torch.zeros((), device=reco_true.device)
+        hit_occ = torch.zeros((), device=reco_true.device)
+        if self.hit_weight > 0 and 'pixels_hit_logits' in pred:
+            hit_logits = pred['pixels_hit_logits']
+            target = (e_true > self.hit_threshold).to(hit_logits.dtype)   # (N,11,43,43)
+            n = target.shape[0]
+            denom = mask.sum() * n
+            with torch.no_grad():
+                pos = (target * mask).sum()
+                pos_weight = ((denom - pos) / pos.clamp(min=1.0)).clamp(1.0, self.hit_pos_weight_max)
+            bce = F.binary_cross_entropy_with_logits(
+                hit_logits, target, pos_weight=pos_weight, reduction='none')
+            hit_loss = (bce * mask).sum() / denom.clamp(min=1.0)
+            hit_occ = ((torch.sigmoid(hit_logits) > 0.5).to(target.dtype) * mask).sum() / n
+
         nll_loss = self.pixel_weight * rec_loss
         if self.ec_weight > 0:
             nll_loss = nll_loss + self.ec_weight * ec_loss
         if self.width_weight > 0:
             nll_loss = nll_loss + self.width_weight * width_loss
+        if self.hit_weight > 0:
+            nll_loss = nll_loss + self.hit_weight * hit_loss
 
         disc_true = batch[f'pixels_{self.disc_normalization}']
         disc_pred = pred[f'pixels_{self.disc_normalization}_pred']
@@ -149,6 +175,8 @@ class CombinedLoss(pl.LightningModule):
                    f"{split}/ec_loss": ec_loss.detach().clone(),
                    f"{split}/width_loss": width_loss.detach().clone(),
                    f"{split}/rec_loss": rec_loss.detach().clone(),
+                   f"{split}/hit_loss": hit_loss.detach().clone(),
+                   f"{split}/hit_occ": hit_occ.detach().clone(),
                    f"{split}/d_weight": d_weight.detach().clone(),
                    f"{split}/disc_factor": disc_factor.detach().clone(),
                    f"{split}/g_loss": g_loss.detach().clone()}

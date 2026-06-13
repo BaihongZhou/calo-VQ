@@ -1,7 +1,8 @@
 # DarkSHINE stage 2 (GPT prior) smoke config.
 # `vq_config.checkpoint` is overridden on the CLI with the stage-1 checkpoint.
-# R ~ 1e-3 for DarkSHINE (4 GeV in, ~3.9 GeV deposited), so R_max is set just
-# above the observed maximum and R_bits gives fine resolution.
+# R = E_dep/E_inc ~ 0.97 for DarkSHINE (3.9 GeV deposited / 4 GeV incident, now in
+# matching MeV units). R_max is set just above the observed maximum (~1.0) and
+# R_bits gives fine resolution.
 data:
   target: calo_ldm.data.DataModuleFromConfig
   params:
@@ -54,11 +55,12 @@ model:
     n_embd: 64
     predict_R: true
     R_bits: 16
-    R_max: 0.0011
+    R_max: 1.1
     cond_bins: 0
     vq_config:
       model_config: config/darkshine_step1.yaml
-      checkpoint: logs/2026-06-10T06-38-39_dss1/checkpoints/epoch=000199.ckpt
+      # validated stage-1 (units + EMA-VQ + hit head); override on the CLI for new runs.
+      checkpoint: logs/2026-06-12T23-09-55_dss1_hithead/checkpoints/last.ckpt
 lightning:
   trainer:
     max_epochs: 200
