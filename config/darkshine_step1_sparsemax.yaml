@@ -1,21 +1,114 @@
-# Output-parameterisation experiment (sparsemax) -- targets the hits/occupancy
-# ~1.8x over-count left by the dense softmax. The decoder energy head now emits
-# EXACT zeros (Euclidean simplex projection) so it can match the genuinely-sparse
-# truth occupancy, instead of the soft non-zero halo that softmax cannot avoid.
-#
-# Stack on the baseline (override-only; everything else stays identical):
+# DarkSHINE stage 1 (VQ-VAE) -- sparsemax output parameterisation.
+# Identical to config/darkshine_step1.yaml EXCEPT the decoder energy head emits
+# EXACT zeros (Euclidean projection onto the simplex, Martins & Astudillo 2016)
+# instead of the dense softmax, so it can match the genuinely-sparse truth
+# occupancy and fix the hits/occupancy ~1.8x over-count. The auxiliary hit/no-hit
+# head + eval gate are off here (occupancy now comes from the output param itself).
 #   PY=/Users/zhoubaihong/miniconda3/envs/caloVQ/bin/python
-#   $PY main.py --base config/darkshine_step1.yaml --base config/darkshine_step1_sparsemax.yaml \
-#       -t True -l logs -n dss1_sparsemax --max_epochs 30
-#
-# Occupancy now comes from the output parameterisation itself, so the auxiliary
-# hit/no-hit head + eval gate are turned off here to measure the raw effect.
-model:
+#   $PY main.py --base config/darkshine_step1_sparsemax.yaml -t True -l logs -n dss1_sparsemax --max_epochs 30
+data:
+  target: calo_ldm.data.DataModuleFromConfig
   params:
-    hit_gate: false              # sparse energy head already emits zeros; don't double-gate
+    num_workers: 16
+    pin_memory: false
+    batch_size: 256
+    train:
+      target: calo_ldm.data.CaloDarkSHINE
+      params:
+        sample_list:
+        - "DarkSHINE_data/j0/export.h5"
+        - "DarkSHINE_data/j1/export.h5"
+        - "DarkSHINE_data/j2/export.h5"
+        - "DarkSHINE_data/j3/export.h5"
+        - "DarkSHINE_data/j4/export.h5"
+        - "DarkSHINE_data/j5/export.h5"
+        - "DarkSHINE_data/j6/export.h5"
+        - "DarkSHINE_data/j7/export.h5"
+        - "DarkSHINE_data/j8/export.h5"
+        - "DarkSHINE_data/j9/export.h5"
+        - "DarkSHINE_data/j10/export.h5"
+        - "DarkSHINE_data/j11/export.h5"
+        - "DarkSHINE_data/j12/export.h5"
+        - "DarkSHINE_data/j13/export.h5"
+    validation:
+      target: calo_ldm.data.CaloDarkSHINE
+      params:
+        sample_list:
+        - "DarkSHINE_data/j14/export.h5"
+        - "DarkSHINE_data/j15/export.h5"
+
+model:
+  target: calo_ldm.models.VQModel
+  params:
+    dataset_name: darkshine
+    mask_path: DarkSHINE_data/geom_mask.npy
+    do_metric: true            # log reco-vs-truth physics metrics each val epoch
+    metric_freq: 1             # emit histograms/figure every N val epochs
+    metric_hit_threshold: 0.1  # [MeV] cell energy above which a cell counts as a hit
+    downsample_mode: sum       # 43x43 -> 21x21 crystal aggregation: sum | min
+    convert_to_detector_shape: false  # true -> postprocess output is (N,11,21,21) (ONNX/export)
+    hit_gate: false            # sparse energy head already emits zeros; don't double-gate
+    hit_gate_threshold: 0.4    # (unused while hit_gate=false; kept for parity)
+    embed_dim: 64
+    n_embed: 1024
+    cond_dim: 1
+    log_scale_params:
+    - 0
+    - 3000
+    - 7
+    reco_normalization: U
+    disc_normalization: U
+    encoder_config:
+      target: calo_ldm.models.Encoder
+      params:
+        ch_in: 11
+        ch_out: 128
+        conv_spec:
+        - 'pconv : k3 :     : p :    : c16'   # (16, 48, 48)
+        - 'pconv : k4 : s2 : p : *2 :'        # (32, 24, 24)
+        - 'pconv : k4 : s2 : p : *2 :'        # (64, 12, 12)
+        - 'pconv : k4 : s2 : p : *2 :'        # (128, 6, 6)
     decoder_config:
+      target: calo_ldm.models.Decoder
       params:
-        output_activation: sparsemax
+        ch_in: 128
+        ch_out: 11
+        output_activation: sparsemax   # EXACT-zero output (vs dense voxel_softmax)
+        conv_spec:
+        - 'pconvT : k4 : s2 : p :    : c64'   # (64, 12, 12)
+        - 'pconvT : k4 : s2 : p : /2 :'       # (32, 24, 24)
+        - 'pconvT : k4 : s2 : p : /2 :'       # (16, 48, 48)
     loss_config:
+      target: calo_ldm.losses.CombinedLoss
       params:
+        pixel_power: 1
+        pixel_weight: 1
+        ec_weight: 0.0001
+        width_weight: 0.0001
         hit_weight: 0.0          # occupancy now from the output param, not the BCE hit head
+        hit_threshold: 0.025     # [MeV] per 43x43 cell = crystal 0.1 MeV / 4
+        disc_start: 10000      # let shape reconstruction/codebook warm up before GAN pressure
+        disc_weight: 0.2
+        codebook_weight: 1.0
+        disc_config:
+          target: calo_ldm.models.Discriminator
+          params:
+            pooling: null
+            ch_in: 11
+            conv_spec:
+            - 'pconv : k3 :     : p :    : c16'  # (16, 48, 48)
+            - 'pconv : k4 : s2 : p : *2 :'       # (32, 24, 24)
+            - 'pconv : k4 : s2 : p : *2 :'       # (64, 12, 12)
+            - 'pconv : k4 : s2 : p : *2 :'       # (128, 6, 6)
+        n_embed: 1024
+        reco_normalization: U
+        disc_normalization: U
+        dataset_name: darkshine
+  base_learning_rate: 2.0e-06
+  monitor: val/rec_loss
+lightning:
+  trainer:
+    max_epochs: 200
+    log_every_n_steps: 1
+    enable_progress_bar: true
+    strategy: 'ddp_find_unused_parameters_true'
