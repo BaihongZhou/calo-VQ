@@ -3,6 +3,7 @@ __pycache__/
 */__pycache__/
 *_data/
 logs/
+eval_out/
 diagnostics/
 .idea/
 *.h5
