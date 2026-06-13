@@ -49,6 +49,7 @@ class CombinedLoss(pl.LightningModule):
         self.hit_weight = hit_weight
         self.hit_threshold = hit_threshold
         self.hit_pos_weight_max = hit_pos_weight_max
+        self.width_eps = 1e-2       # [cm^2] floor inside sqrt -> bounds the width gradient
         self.reco_normalization = reco_normalization
         self.disc_normalization = disc_normalization
         self.adaptive_max = adaptive_max
@@ -92,13 +93,23 @@ class CombinedLoss(pl.LightningModule):
 
     def _centre_width(self, energy):
         # energy ~ (N, depth, x, y); returns per-(N,depth) centre & width in x and y.
-        s = energy.sum(axis=(-1, -2)) + 1e-16                 # (N, depth)
+        # Floor the per-layer denominator at a small fraction of the shower's total
+        # energy: an empty/near-empty depth layer has an ill-defined centroid, and a
+        # ~1e-16 floor lets 1/s ~ 1e16 blow up the gradient (this -- not the sqrt --
+        # is what wrecks nll_loss). The floor is detached so it only bounds 1/s.
+        s_layer = energy.sum(axis=(-1, -2))                   # (N, depth)
+        floor = (1e-3 * s_layer.sum(-1, keepdim=True)).detach().clamp(min=1e-3)
+        s = torch.maximum(s_layer, floor)
         ec_x = (self.x_grid * energy).sum(axis=(-1, -2)) / s
         ec_y = (self.y_grid * energy).sum(axis=(-1, -2)) / s
         x2 = (self.x_grid ** 2 * energy).sum(axis=(-1, -2)) / s
         y2 = (self.y_grid ** 2 * energy).sum(axis=(-1, -2)) / s
-        wx = torch.sqrt((x2 - ec_x ** 2).clip(min=0.))
-        wy = torch.sqrt((y2 - ec_y ** 2).clip(min=0.))
+        # eps inside the sqrt: d/dv sqrt(v) -> inf as v->0, so a depth layer whose
+        # (predicted) energy collapses toward a single cell (variance ~0, common in
+        # deep layers / a sharpened softmax) produces a NaN/exploding gradient that
+        # blows up nll_loss. eps bounds the gradient to 1/(2*sqrt(eps)).
+        wx = torch.sqrt((x2 - ec_x ** 2).clip(min=0.) + self.width_eps)
+        wy = torch.sqrt((y2 - ec_y ** 2).clip(min=0.) + self.width_eps)
         return ec_x, ec_y, wx, wy
 
     def forward(self, batch, pred, optimizer_idx, global_step, last_layer=None, split='train'):
