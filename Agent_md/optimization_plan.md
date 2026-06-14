@@ -243,3 +243,61 @@ gate behind `do_metric` so smoke runs stay fast.
   `disc_start`, `disc_weight`, and consider spectral norm if training is unstable at scale.
 - **Throughput**: real training needs GPU + full dataset (drop `load_partial`), more epochs,
   and `num_workers>0`; current smoke configs are CPU/tiny on purpose.
+
+---
+
+## 2026-06-14 — output-parameterisation experiment (sparsemax) — FAILED, reverted
+
+**Hypothesis.** Generation's residual blemish is occupancy (`hits` over-count). The dense
+masked voxel-softmax can never emit exact zeros, so it always leaves a non-zero halo →
+too many hits and an irreducible U-space recon-L1 floor vs the genuinely-sparse truth.
+Idea: replace softmax with a sparse output transform that can emit EXACT zeros
+(sparsemax = Euclidean projection onto the simplex; relu_norm = relu+renormalise), still
+summing to 1 over real cells so the whole downstream (R/disc/loss/gate/stage-2) is unchanged.
+Implemented as a configurable `Decoder.output_activation` (default `voxel_softmax`), with
+standalone configs `config/darkshine_step1_sparsemax.yaml` / `_relunorm.yaml` (hit_gate off,
+hit_weight 0, so occupancy comes from the output transform alone).
+
+**Result — sparsemax is clearly WORSE.** 200-epoch runs:
+- baseline softmax + hit-head + gate: `logs/2026-06-13T10-17-36_dss1`
+- sparsemax (no hit head): `logs/2026-06-13T13-35-53_dss1`
+
+| metric (val/reco) | truth | baseline (softmax+gate) | sparsemax |
+|---|---|---|---|
+| `rec_loss` (U, L1) | — | **0.183** | 0.385 (2.1× worse) |
+| `hits_ratio` | 1.0 | **0.94** | 0.53 (over-sparsified) |
+| `L1_width_x` | — | **1.87** | 2.24 |
+| `z_cog_ratio` | 1.0 | 0.947 | 0.944 |
+| `z_sigma_ratio` | 1.0 | 0.920 | **1.012** |
+| `E_tot_ratio` | 1.0 | 1.0 | 1.0 |
+| perplexity / cluster_usage | — | 137 / 0.82 | 168 / 0.86 |
+
+**Root cause (two compounding mistakes).**
+1. **Wrong baseline in my head.** The blemish was the *un-gated* fix3 (`hits≈1.8×`). The
+   current baseline already carries the hit-head + eval gate and reaches `hits≈0.94` —
+   occupancy was already essentially solved. I optimised a problem that was no longer open.
+2. **Wrong sparsity prior for the physics.** sparsemax is "peaky / winner-take-most": a
+   single global threshold τ hard-cuts small entries to 0. But a shower's per-cell energy
+   distribution is **long-tailed** (a few hot cells + a broad low-energy tail of many small
+   hits). sparsemax truncates that tail (`hits` 206→108), then piles the mass back onto the
+   survivors, distorting the shape → recon-L1 *doubles*. It over-corrected from "too many
+   hits" all the way to "too few".
+
+**Lesson (load-bearing).** **Occupancy is best modelled SEPARATELY from shape**, not folded
+into the energy distribution. The existing decomposition — smooth softmax for shape + an
+independent BCE hit-head + a hard gate for occupancy — is the right design; sparsemax
+re-couples the two jobs into one transform under a sparsity prior that does not match the
+long-tailed shower. `relu_norm` was not run (predicted to share the failure mode, softer);
+not worth the compute given sparsemax's clear regression. The `output_activation` knob and
+configs are kept in the tree (default `voxel_softmax`) but **sparse output is abandoned**;
+step-1 of record stays the hit-head baseline (`logs/2026-06-13T10-17-36_dss1`).
+
+**Reframe — where the real step-1 ceiling is.** The baseline is already strong (rec 0.183,
+all ratios near 1, hits 0.94). The remaining shape residuals (width L1≈1.9, z_sigma 0.92)
+are a **backbone/capacity** question, not an output-transform one — no output activation
+changes how well the encoder/decoder capture shape. Next, low-risk step before any wholesale
+ViT rewrite: add 1–2 self-attention blocks at the CNN **bottleneck (6×6)** (the
+taming-transformers/VQGAN pattern) — cheap (36 tokens), keeps all CNN inductive bias, and
+directly tests whether global mixing buys shape fidelity. If it helps, escalate toward ViT;
+if not, the backbone is not the limit. Implemented as `bottleneck_attn` on Encoder/Decoder
+(default 0 = off, i.e. identity), config `config/darkshine_step1_attn.yaml`.

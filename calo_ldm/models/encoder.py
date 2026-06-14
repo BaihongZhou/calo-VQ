@@ -3,6 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 
 from ..layers.misc import LogScale
+from ..layers.attention import AttnBlock
 from ..util import get_activation_by_name, parse_conv_spec, conv_padding
 
 
@@ -26,6 +27,7 @@ class Encoder(nn.Module):
             log_scale_params=None,
             pad_to=48,             # pad the (x, y) plane up to this size
             input_hw=43,
+            bottleneck_attn=0,     # number of self-attention blocks at the latent (6x6) bottleneck
             # accepted for config-passthru compatibility but unused in xyz:
             z_pad=None, z_padding_strategy=None,
             ):
@@ -65,6 +67,11 @@ class Encoder(nn.Module):
         if output_activation_class is not None:
             self.layers.append(output_activation_class())
 
+        # optional self-attention over the (6x6) latent plane: global mixing the
+        # strided CNN's receptive field cannot reach. Zero-init residual -> identity
+        # at init, so attn=0 reproduces the pure-CNN encoder exactly.
+        self.bottleneck_attn = nn.Sequential(*[AttnBlock(ch_out) for _ in range(bottleneck_attn)])
+
     def forward(self, x, cond=None):
         # x ~ (N, depth, x, y); cond ~ (N, 1)
         if self.log_scale:
@@ -83,4 +90,5 @@ class Encoder(nn.Module):
         out = x
         for layer in self.layers:
             out = layer(out)
+        out = self.bottleneck_attn(out)
         return out

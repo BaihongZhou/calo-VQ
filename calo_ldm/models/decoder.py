@@ -3,6 +3,7 @@ from torch import nn
 import pytorch_lightning as pl
 import torch.nn.functional as F
 
+from ..layers.attention import AttnBlock
 from ..util import get_activation_by_name, parse_conv_spec, conv_padding, load_geom_mask
 
 
@@ -32,6 +33,7 @@ class Decoder(pl.LightningModule):
             out_size=43,           # cropped output plane size
             learn_R=False,
             ch_init=-1,
+            bottleneck_attn=0,     # number of self-attention blocks at the latent (6x6) bottleneck
             # accepted for config-passthru compatibility but unused in xyz:
             z_pad=None, z_padding_strategy=None, R_activation='softplus', R_trim=1e-2,
             ):
@@ -77,6 +79,12 @@ class Decoder(pl.LightningModule):
         self.register_buffer('real_idx', real_idx, persistent=False)
 
         activation_class = get_activation_by_name(activation)
+
+        # optional self-attention over the (6x6) latent plane, applied to the latent
+        # BEFORE the conditioning channel is concatenated (so GroupNorm sees ch_in).
+        # Zero-init residual -> identity at init, so attn=0 reproduces the pure-CNN
+        # decoder exactly and a warm-started checkpoint is unperturbed.
+        self.bottleneck_attn = nn.Sequential(*[AttnBlock(ch_in) for _ in range(bottleneck_attn)])
 
         self.dec_layers = nn.Sequential()
         w_in = ch_in + cond_dim
@@ -163,6 +171,7 @@ class Decoder(pl.LightningModule):
 
     def forward(self, x, cond=None):
         # x ~ (N, ch_in, h, w); cond ~ (N, 1)
+        x = self.bottleneck_attn(x)
         if self.cond_dim > 0:
             xc = cond[:, None, None].expand((-1, -1, x.shape[-2], x.shape[-1]))
             x = torch.concat([x, xc], axis=-3)
