@@ -89,6 +89,13 @@ model:
         width_weight: 0.0001
         hit_weight: 1.0
         hit_threshold: 0.025
+        # soft-occupancy false-positive penalty on the energy output (teaches the
+        # energy decoder itself to suppress truth-dark cells). fp_threshold/T
+        # default to hit_threshold and hit_threshold/5. fp_start ramps it in after
+        # the codebook/energy stabilise (NaN safety, cf. the fine-tune NaN history);
+        # set fp_start: 0 to exercise it from step 0 in a smoke test.
+        fp_weight: 0.5
+        fp_start: 2000
         disc_start: 10000
         disc_weight: 0.2
         codebook_weight: 1.0

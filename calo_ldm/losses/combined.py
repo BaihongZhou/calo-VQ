@@ -29,6 +29,7 @@ class CombinedLoss(pl.LightningModule):
                  pixel_power=2, pixel_weight=1,
                  ec_weight=0., width_weight=0.,
                  hit_weight=0., hit_threshold=0.025, hit_pos_weight_max=50.,
+                 fp_weight=0., fp_threshold=None, fp_temperature=None, fp_start=0,
                  disc_config=None,
                  cond_dim=0, log_scale_params=None,
                  reco_normalization='R', disc_normalization='U',
@@ -49,6 +50,17 @@ class CombinedLoss(pl.LightningModule):
         self.hit_weight = hit_weight
         self.hit_threshold = hit_threshold
         self.hit_pos_weight_max = hit_pos_weight_max
+        # soft-occupancy false-positive penalty applied DIRECTLY to the energy
+        # output (not a detached head): a differentiable soft gate
+        # sigmoid((E_pred - tau)/T) penalised only where truth is dark, so the
+        # energy decoder itself learns to keep truth-dark cells below threshold.
+        # tau shares the hit grid (per-43x43-cell MeV); T defaults to tau/5 so a
+        # ~0 cell reads sigmoid(-5)~=0.007. fp_start ramps it in (NaN safety).
+        self.fp_weight = fp_weight
+        self.fp_threshold = hit_threshold if fp_threshold is None else fp_threshold
+        self.fp_temperature = (self.fp_threshold / 5.0) if fp_temperature is None \
+            else fp_temperature
+        self.fp_start = fp_start
         self.width_eps = 1e-2       # [cm^2] floor inside sqrt -> bounds the width gradient
         self.reco_normalization = reco_normalization
         self.disc_normalization = disc_normalization
@@ -148,6 +160,19 @@ class CombinedLoss(pl.LightningModule):
             hit_loss = (bce * mask).sum() / denom.clamp(min=1.0)
             hit_occ = ((torch.sigmoid(hit_logits) > 0.5).to(target.dtype) * mask).sum() / n
 
+        # ---- soft occupancy: one-sided false-positive penalty on the energy ----
+        # Acts on e_pred directly (gradient -> energy decoder), unlike the detached
+        # hit head. Only penalises lighting truth-dark cells; recon handles the
+        # bright ones, so this adds sparsity pressure with minimal fight vs width.
+        fp_loss = torch.zeros((), device=reco_true.device)
+        if self.fp_weight > 0:
+            n_fp = e_true.shape[0]
+            p_hit = torch.sigmoid((e_pred - self.fp_threshold) / self.fp_temperature)
+            dark = (e_true <= self.fp_threshold).to(p_hit.dtype)
+            denom_fp = (mask.sum() * n_fp).clamp(min=1.0)
+            fp_loss = (p_hit * dark * mask).sum() / denom_fp
+            fp_loss = adopt_weight(1.0, global_step, threshold=self.fp_start) * fp_loss
+
         nll_loss = self.pixel_weight * rec_loss
         if self.ec_weight > 0:
             nll_loss = nll_loss + self.ec_weight * ec_loss
@@ -155,6 +180,8 @@ class CombinedLoss(pl.LightningModule):
             nll_loss = nll_loss + self.width_weight * width_loss
         if self.hit_weight > 0:
             nll_loss = nll_loss + self.hit_weight * hit_loss
+        if self.fp_weight > 0:
+            nll_loss = nll_loss + self.fp_weight * fp_loss
 
         disc_true = batch[f'pixels_{self.disc_normalization}']
         disc_pred = pred[f'pixels_{self.disc_normalization}_pred']
@@ -188,6 +215,7 @@ class CombinedLoss(pl.LightningModule):
                    f"{split}/rec_loss": rec_loss.detach().clone(),
                    f"{split}/hit_loss": hit_loss.detach().clone(),
                    f"{split}/hit_occ": hit_occ.detach().clone(),
+                   f"{split}/fp_loss": fp_loss.detach().clone(),
                    f"{split}/d_weight": d_weight.detach().clone(),
                    f"{split}/disc_factor": disc_factor.detach().clone(),
                    f"{split}/g_loss": g_loss.detach().clone()}
