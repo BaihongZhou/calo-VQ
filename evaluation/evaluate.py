@@ -71,7 +71,12 @@ def main():
     ap.add_argument("--nevts", type=int, default=None,
                     help="cap events used from each file")
     ap.add_argument("--hit-threshold", type=float, default=0.1,
-                    help="[MeV] cell hit threshold (multiplicity/occupancy)")
+                    help="[MeV] per-CRYSTAL hit threshold for multiplicity / occupancy "
+                         "/ pixel spectrum. Default 0.1 MeV is the 21x21-crystal "
+                         "equivalent of the model's hit-head target E_cell>0.025 MeV "
+                         "on the 43x43 grid (a truth hit splits equally over its 2x2 "
+                         "block, so crystal = 4x cell). Drops ~4.3%% of truth hits and "
+                         "~0.009%% of truth energy.")
     ap.add_argument("--lowdep-frac", type=float, default=0.5,
                     help="low-deposit selection: keep events with E_tot < frac*E_inc")
     ap.add_argument("--batch-size", type=int, default=512)
@@ -176,8 +181,13 @@ def main():
         _log(f"  {fname}: {NZ} layers done")
 
     _log("metric 6/6: pixel-level energy spectrum (E_i / E_tot, log-log)")
-    ref_pix = pixel_norm_energies(ref_c)
-    gen_pix = pixel_norm_energies(gen_c)
+    # Threshold on the raw cell energy (MeV) so the decoder's masked-softmax
+    # "dust" (tiny non-zero E_i ~1e-30..1e-40 in every crystal, which Geant4's
+    # sparse truth never has) is excluded -- otherwise it fakes a huge low-E
+    # excess and blows up the density on log bins. Same readout threshold both
+    # samples see in the hits/occupancy metrics.
+    ref_pix = pixel_norm_energies(ref_c, hit_threshold=args.hit_threshold)
+    gen_pix = pixel_norm_energies(gen_c, hit_threshold=args.hit_threshold)
     seps["pixel_spectrum"] = plots.pixel_spectrum(
         ref_pix, gen_pix, os.path.join(args.out, "pixel_spectrum.png"))
 
