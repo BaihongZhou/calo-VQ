@@ -110,7 +110,7 @@ model:
   monitor: val/rec_loss
 lightning:
   trainer:
-    max_epochs: 200
+    max_epochs: 600
     log_every_n_steps: 1
     enable_progress_bar: true
     strategy: 'ddp_find_unused_parameters_true'

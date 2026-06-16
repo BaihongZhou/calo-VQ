@@ -55,7 +55,7 @@ def get_parser(**parser_kwargs):
     # it onto accelerator/devices ourselves. None/0 -> CPU.
     parser.add_argument("--gpus", type=str, default=None,
                         help="comma-separated GPU ids or a count. Omit / 0 for CPU.")
-    parser.add_argument("--max_epochs", type=int, default=200,
+    parser.add_argument("--max_epochs", type=int, default=1000,
                         help="convenience override for lightning.trainer.max_epochs")
     return parser
 
@@ -187,7 +187,7 @@ if __name__ == "__main__":
         if hasattr(model, "monitor"):
             print(f"Monitoring {model.monitor} as checkpoint metric.")
             default_modelckpt_cfg["params"]["monitor"] = model.monitor
-            default_modelckpt_cfg["params"]["save_top_k"] = 3
+            default_modelckpt_cfg["params"]["save_top_k"] = 1
         modelckpt_cfg = lightning_config.get("modelcheckpoint", OmegaConf.create())
         modelckpt_cfg = OmegaConf.merge(default_modelckpt_cfg, modelckpt_cfg)
 

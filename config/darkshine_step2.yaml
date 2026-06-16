@@ -58,9 +58,9 @@ model:
     R_max: 1.1
     cond_bins: 0
     vq_config:
-      model_config: config/darkshine_step1.yaml
+      model_config: config/darkshine_step1_attn.yaml
       # validated stage-1 (units + EMA-VQ + hit head); override on the CLI for new runs.
-      checkpoint: logs/2026-06-12T23-09-55_dss1_hithead/checkpoints/last.ckpt
+      checkpoint: logs/2026-06-15T05-23-08_dss1/checkpoints/epoch=000989.ckpt
 lightning:
   trainer:
     max_epochs: 200
