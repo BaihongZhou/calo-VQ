@@ -1,6 +1,12 @@
-# DarkSHINE stage 1 (VQ-VAE) smoke config.
-# Geometry: channels-last (N,43,43,11) -> channels-first (N,11,43,43); depth(11)
-# is the conv channel axis, (x,y)=43x43 the image plane (padded to 48 internally).
+# DarkSHINE stage 1 (VQ-VAE) -- CNN + bottleneck self-attention.
+# Identical to config/darkshine_step1.yaml (the hit-head baseline of record) EXCEPT
+# the encoder/decoder each get 2 self-attention blocks at the 6x6 latent bottleneck
+# (taming-transformers / VQGAN pattern). 36 tokens -> cheap; the zero-init residual
+# makes attn an identity at init, so this can only help vs the pure-CNN baseline.
+# Low-risk test of whether global mixing buys shape fidelity (width / z_sigma) before
+# any wholesale ViT rewrite.
+#   PY=/Users/zhoubaihong/miniconda3/envs/caloVQ/bin/python
+#   $PY main.py --base config/darkshine_step1.yaml -t True -l logs -n dss1_attn --max_epochs 30
 data:
   target: calo_ldm.data.DataModuleFromConfig
   params:
@@ -37,13 +43,13 @@ model:
   params:
     dataset_name: darkshine
     mask_path: DarkSHINE_data/geom_mask.npy
-    do_metric: true            # log reco-vs-truth physics metrics each val epoch
-    metric_freq: 1             # emit histograms/figure every N val epochs
-    metric_hit_threshold: 0.1  # [MeV] cell energy above which a cell counts as a hit
-    downsample_mode: sum       # 43x43 -> 21x21 crystal aggregation: sum | min
-    convert_to_detector_shape: false  # true -> postprocess output is (N,11,21,21) (ONNX/export)
-    hit_gate: true             # apply the decoder hit/no-hit gate at eval/generation
-    hit_gate_threshold: 0.4    # sigmoid(hit_logits)>thr kept; calibrated for hits~1 (see optimization_plan)
+    do_metric: true
+    metric_freq: 1
+    metric_hit_threshold: 0.1
+    downsample_mode: sum
+    convert_to_detector_shape: false
+    hit_gate: true             # keep the occupancy decomposition that the baseline uses
+    hit_gate_threshold: 0.4
     embed_dim: 64
     n_embed: 1024
     cond_dim: 1
@@ -58,6 +64,7 @@ model:
       params:
         ch_in: 11
         ch_out: 128
+        bottleneck_attn: 2       # self-attention at the 6x6 latent
         conv_spec:
         - 'pconv : k3 :     : p :    : c16'   # (16, 48, 48)
         - 'pconv : k4 : s2 : p : *2 :'        # (32, 24, 24)
@@ -68,6 +75,7 @@ model:
       params:
         ch_in: 128
         ch_out: 11
+        bottleneck_attn: 2       # self-attention at the 6x6 latent
         conv_spec:
         - 'pconvT : k4 : s2 : p :    : c64'   # (64, 12, 12)
         - 'pconvT : k4 : s2 : p : /2 :'       # (32, 24, 24)
@@ -79,9 +87,9 @@ model:
         pixel_weight: 1
         ec_weight: 0.0001
         width_weight: 0.0001
-        hit_weight: 1.0          # masked BCE occupancy head (sparse-shower / hits fix)
-        hit_threshold: 0.025     # [MeV] per 43x43 cell = crystal 0.1 MeV / 4
-        disc_start: 10000      # let shape reconstruction/codebook warm up before GAN pressure
+        hit_weight: 1.0
+        hit_threshold: 0.025
+        disc_start: 10000
         disc_weight: 0.2
         codebook_weight: 1.0
         disc_config:
@@ -102,7 +110,7 @@ model:
   monitor: val/rec_loss
 lightning:
   trainer:
-    max_epochs: 200
+    max_epochs: 600
     log_every_n_steps: 1
     enable_progress_bar: true
     strategy: 'ddp_find_unused_parameters_true'
